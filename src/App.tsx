@@ -523,7 +523,7 @@ function Codex({ models, status, busy, runBusy, notify }: { models: string[]; st
       message: result.message,
       tone: result.ok ? 'success' : 'error',
       manual: true,
-      details: `配置文件：${result.config_path}${result.backup_path ? `\n备份文件：${result.backup_path}` : ''}`,
+      details: `配置文件：${result.config_path}${result.backup_path ? `\n备份文件：${result.backup_path}` : ''}\n本地代理绕过：NO_PROXY=localhost,127.0.0.1,::1\n如 Codex CLI 或终端已打开，请重启终端/Codex 后再测试。`,
     });
   };
   return (
@@ -532,6 +532,7 @@ function Codex({ models, status, busy, runBusy, notify }: { models: string[]; st
         <h3>一键配置 Codex</h3>
         <p>将 Codex 配置到本地网关：<code>{status?.bind_url ?? 'http://127.0.0.1:14555/v1'}</code></p>
         <p>配置文件路径：<code>{configPath || '~/.codex/config.toml'}</code></p>
+        <p className="inline-help">写入时会同时配置 <code>NO_PROXY=localhost,127.0.0.1,::1</code>，避免系统代理把本地网关请求拦截成 502。</p>
         {!models.length && <p className="empty-state error">暂无已发现的 GPT 模型，请先到供应商页点击“一键查询模型”。</p>}
         <label>默认模型
           <select value={model} disabled={!models.length} onChange={(e) => setModel(e.target.value)}>

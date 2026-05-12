@@ -214,12 +214,6 @@ pub struct ModelInfo {
     pub raw: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ModelsListResponse {
-    pub object: String,
-    pub data: Vec<ModelInfo>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestLogEntry {

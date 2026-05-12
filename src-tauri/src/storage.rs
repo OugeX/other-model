@@ -202,6 +202,12 @@ impl Storage {
 }
 
 pub fn app_data_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("OTHER_MODEL_DATA_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
     let base = dirs::data_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));

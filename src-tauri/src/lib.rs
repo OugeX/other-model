@@ -20,6 +20,27 @@ pub async fn run_gateway_only() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn configure_codex_no_proxy_only() -> anyhow::Result<()> {
+    codex_config::configure_codex_proxy_bypass_only().await
+}
+
+pub async fn configure_codex_from_local_config(model: String) -> anyhow::Result<()> {
+    let storage = Storage::load().await?;
+    let cfg = storage.config().await;
+    let gateway_base_url = format!("http://{}:{}/v1", cfg.gateway.host, cfg.gateway.port);
+    let result = codex_config::configure_codex(
+        models::ConfigureCodexRequest {
+            model,
+            provider_name: None,
+        },
+        gateway_base_url,
+        cfg.local_auth_token,
+    )
+    .await?;
+    eprintln!("{}", result.message);
+    Ok(())
+}
+
 pub fn run() {
     tauri::async_runtime::block_on(async move {
         let storage = Storage::load().await.expect("load storage");

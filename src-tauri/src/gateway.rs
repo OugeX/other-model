@@ -1,6 +1,6 @@
 use crate::models::{
-    GatewayStatus, ModelInfo, ModelsCache, ModelsListResponse, ProviderConfig, ProviderHealth,
-    ProviderModels, ProviderState, RequestLogEntry,
+    GatewayStatus, ModelInfo, ModelsCache, ProviderConfig, ProviderHealth, ProviderModels,
+    ProviderState, RequestLogEntry,
 };
 use crate::storage::Storage;
 use anyhow::{anyhow, Context, Result};
@@ -648,7 +648,6 @@ impl GatewayManager {
                             )
                             .await;
                     }
-                    let _ = self.inner.storage.append_log(&stream_log).await;
                     return self
                         .stream_opened_upstream(opened, stream_log, started)
                         .await;
@@ -777,31 +776,44 @@ impl GatewayManager {
         let initial_latency = opened.latency_ms;
         let stream = stream! {
             let mut upstream = opened.response.bytes_stream();
+            let mut keepalive = tokio::time::interval(Duration::from_secs(3));
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut first = true;
             let mut saw_error = false;
-            while let Some(item) = upstream.next().await {
-                match item {
-                    Ok(chunk) => {
-                        if first {
-                            first = false;
-                            if status.is_success() {
-                                let _ = manager.record_provider_success(&provider_for_stream, Some(status.as_u16()), Some(initial_latency), None).await;
+            loop {
+                tokio::select! {
+                    item = upstream.next() => {
+                        let Some(item) = item else { break; };
+                        match item {
+                            Ok(chunk) => {
+                                if chunk.is_empty() {
+                                    continue;
+                                }
+                                if first {
+                                    first = false;
+                                    if status.is_success() {
+                                        let _ = manager.record_provider_success(&provider_for_stream, Some(status.as_u16()), Some(initial_latency), None).await;
+                                    }
+                                }
+                                if let Some(id) = extract_response_id_from_sse(&chunk) {
+                                    let _ = manager.remember_response_route(id, provider_for_stream.id.clone()).await;
+                                }
+                                yield Ok::<Bytes, std::io::Error>(chunk);
+                            }
+                            Err(err) => {
+                                saw_error = true;
+                                eprintln!("apidev stream interrupted id={} provider={} error={}", log.id, provider_for_stream.name, err);
+                                let err_msg = format!("stream interrupted: {err}");
+                                let _ = manager.record_provider_degraded(&provider_for_stream, err_msg.clone()).await;
+                                log.error = Some(err_msg.clone());
+                                let msg = format!("event: error\ndata: {{\"error\":{{\"message\":\"upstream stream interrupted after output: {}\"}}}}\n\n", escape_json_string(&err.to_string()));
+                                yield Ok::<Bytes, std::io::Error>(Bytes::from(msg));
+                                break;
                             }
                         }
-                        if let Some(id) = extract_response_id_from_sse(&chunk) {
-                            let _ = manager.remember_response_route(id, provider_for_stream.id.clone()).await;
-                        }
-                        yield Ok::<Bytes, std::io::Error>(chunk);
                     }
-                    Err(err) => {
-                        saw_error = true;
-                        eprintln!("apidev stream interrupted id={} provider={} error={}", log.id, provider_for_stream.name, err);
-                        let err_msg = format!("stream interrupted: {err}");
-                        let _ = manager.record_provider_degraded(&provider_for_stream, err_msg.clone()).await;
-                        log.error = Some(err_msg.clone());
-                        let msg = format!("event: error\ndata: {{\"error\":{{\"message\":\"upstream stream interrupted after output: {}\"}}}}\n\n", escape_json_string(&err.to_string()));
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from(msg));
-                        break;
+                    _ = keepalive.tick(), if first => {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b": other-model keepalive\n\n"));
                     }
                 }
             }
@@ -978,10 +990,12 @@ async fn list_models_handler(State(state): State<GatewayAppState>, headers: Head
         }
     }
     data.sort_by(|a, b| a.id.cmp(&b.id));
-    Json(ModelsListResponse {
-        object: "list".to_string(),
-        data,
-    })
+    let catalog_models: Vec<Value> = data.iter().map(codex_catalog_model).collect();
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "models": catalog_models,
+    }))
     .into_response()
 }
 
@@ -1225,6 +1239,56 @@ fn escape_json_string(input: &str) -> String {
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+fn codex_catalog_model(model: &ModelInfo) -> Value {
+    json!({
+        "slug": model.id,
+        "display_name": model.id,
+        "description": format!("Discovered by Other Model from upstream provider cache: {}", model.id),
+        "base_instructions": "You are Codex, a coding agent based on GPT-5. You and the user share one workspace, and your job is to collaborate with them until their goal is handled.",
+        "model_messages": {
+            "instructions_template": "You are Codex, a coding agent based on GPT-5. You and the user share one workspace, and your job is to collaborate with them until their goal is handled.\n\n{{ personality }}",
+            "instructions_variables": {
+                "personality_default": "",
+                "personality_friendly": "# Personality\n\nYou are warm, collaborative, and concise.",
+                "personality_pragmatic": "# Personality\n\nYou are pragmatic, direct, and concise."
+            }
+        },
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            { "effort": "low", "description": "Fast responses with lighter reasoning" },
+            { "effort": "medium", "description": "Balanced reasoning depth" },
+            { "effort": "high", "description": "Greater reasoning depth" },
+            { "effort": "xhigh", "description": "Extra high reasoning depth" }
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "minimal_client_version": "0.98.0",
+        "supported_in_api": true,
+        "availability_nux": null,
+        "upgrade": null,
+        "priority": 50,
+        "prefer_websockets": false,
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "input_modalities": ["text", "image"],
+        "supports_image_detail_original": true,
+        "truncation_policy": { "mode": "tokens", "limit": 10000 },
+        "supports_parallel_tool_calls": true,
+        "context_window": 272000,
+        "max_context_window": 1000000,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "reasoning_summary_format": "experimental",
+        "default_reasoning_summary": "none",
+        "supports_search_tool": true,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "supports_reasoning_summaries": true
+    })
 }
 
 #[cfg(test)]

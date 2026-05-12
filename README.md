@@ -83,9 +83,33 @@ base_url = "http://127.0.0.1:14555/v1"
 wire_api = "responses"
 supports_websockets = false
 experimental_bearer_token = "..."
+
+[shell_environment_policy.set]
+NO_PROXY = "localhost,127.0.0.1,::1"
+no_proxy = "localhost,127.0.0.1,::1"
 ```
 
-Before modifying Codex config, the app creates `config.toml.other-model-bak-<timestamp>` next to the original file.
+Before modifying Codex config, the app creates `config.toml.other-model-bak-<timestamp>` next to the original file. On macOS it also writes `~/.codex/other-model-env.sh` and sources it from `~/.zshrc` / `~/.zprofile`, then sets `launchctl` `NO_PROXY` for newly launched GUI apps. This prevents local gateway requests from being routed through a system HTTP proxy and returning `502 Bad Gateway`.
+
+If Codex CLI still reports `unexpected status 502 Bad Gateway` and the Other Model request log has no matching request, restart Terminal/Codex or run the CLI with:
+
+```bash
+NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 codex exec "只回复 pong"
+```
+
+## macOS unsigned builds
+
+Public CI builds are currently unsigned. If macOS shows `"Other Model" is damaged and can't be opened` after copying from WeChat, a browser, or another Mac, remove the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Other Model.app"
+```
+
+For local redistribution you can also ad-hoc sign the app before packaging:
+
+```bash
+codesign --force --deep --sign - "/Applications/Other Model.app"
+```
 
 ## Provider import/export
 

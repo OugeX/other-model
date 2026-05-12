@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+
+# frontend build
+dist/
+
+# tauri/rust build
+src-tauri/target/
+
+# local app/runtime data and secrets
+*.log
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.mobileprovision
+.DS_Store
+
+# generated local exports / caches
+providers-export-*.json
+other-model-providers-*.json
+models_cache.json
+request-log.jsonl
+state.json
+config.toml
+
+# mobile icon outputs not used by desktop bundles
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/Square*Logo.png
+src-tauri/icons/StoreLogo.png

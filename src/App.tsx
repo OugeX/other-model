@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { open } from '@tauri-apps/plugin-dialog';
 import { api } from './api';
 import type {
@@ -144,7 +145,7 @@ function TotalPopup({ popup, onClose }: { popup: TotalPopupState; onClose: () =>
     return () => window.clearTimeout(timer);
   }, [popup, onClose]);
 
-  return (
+  return createPortal(
     <div className="total-popup-backdrop" role="presentation" onClick={onClose}>
       <div className={`total-popup ${popup.tone ?? 'info'}`} role="status" aria-live="polite" onClick={(event) => event.stopPropagation()}>
         <div className="total-popup-icon">{popup.tone === 'success' ? '✓' : popup.tone === 'error' ? '!' : popup.tone === 'warning' ? '⚠' : 'i'}</div>
@@ -155,7 +156,8 @@ function TotalPopup({ popup, onClose }: { popup: TotalPopupState; onClose: () =>
           {popup.manual && <button onClick={onClose}>知道了</button>}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

@@ -14,7 +14,10 @@ pub async fn run_gateway_only() -> anyhow::Result<()> {
     let storage = Storage::load().await?;
     let gateway = GatewayManager::new(storage);
     let status = gateway.start().await?;
-    eprintln!("Other Model headless gateway listening at {}", status.bind_url);
+    eprintln!(
+        "Other Model headless gateway listening at {}",
+        status.bind_url
+    );
     tokio::signal::ctrl_c().await?;
     let _ = gateway.stop().await;
     Ok(())

@@ -42,7 +42,9 @@ impl Storage {
                 .with_context(|| format!("parse {}", config_path.display()))?;
             let should_save = !raw.contains("auto_round_robin")
                 || !raw.contains("auto_failover")
-                || !raw.contains("selected_provider_id");
+                || !raw.contains("selected_provider_id")
+                || !raw.contains("stream_idle_timeout_secs")
+                || !raw.contains("max_request_body_mb");
             (cfg, should_save)
         } else {
             let cfg = AppConfig::default();

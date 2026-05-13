@@ -1,7 +1,9 @@
 fn main() {
     if let Some(model) = configure_codex_model_arg() {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-        if let Err(err) = runtime.block_on(other_model_lib::configure_codex_from_local_config(model)) {
+        if let Err(err) =
+            runtime.block_on(other_model_lib::configure_codex_from_local_config(model))
+        {
             eprintln!("configure-codex failed: {err}");
             std::process::exit(1);
         }

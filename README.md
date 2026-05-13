@@ -21,9 +21,12 @@ Other Model is a local OpenAI-compatible desktop gateway for Codex and GPT-serie
   - single selected provider when round-robin is disabled;
   - optional automatic failover for 401/402/403/429/5xx/model errors.
 - SSE streaming support: failover before first output; no replay after output begins.
+- Large Codex request support: local body limit defaults to 512 MB instead of Axum's small default, with structured 413 logs when exceeded.
+- Long-running Codex stream support with configurable idle timeout.
 - Model discovery, GPT model filtering, and provider-level model tests.
 - Optional quota endpoint adapter plus request logs.
 - One-click Codex config update with automatic backup.
+- One-click gateway self-check for health, models, Responses, large bodies, streaming, and failover readiness.
 - Lightweight local plaintext storage.
 
 ## Downloads
@@ -68,6 +71,15 @@ Runtime config is stored in the OS data directory under `Other Model`:
 - `state.json`
 
 API keys are stored in plaintext for this MVP. Provider import/export JSON files also contain plaintext API keys, so keep them private.
+
+Gateway defaults:
+
+- local base URL: `http://127.0.0.1:14555/v1`
+- max request body: `512 MB`
+- non-stream request timeout: `300s`
+- stream idle timeout: `300s`
+
+If a request exceeds the configured local body limit, Other Model returns a structured `413 Payload Too Large` JSON response and writes a request log row with `local_rejected=true`.
 
 ## Codex configuration
 
@@ -118,4 +130,14 @@ codesign --force --deep --sign - "/Applications/Other Model.app"
 
 ## Release workflow
 
-The repository includes a GitHub Actions workflow that builds release artifacts for macOS ARM64, macOS Intel, and Windows x64 when a version tag such as `v0.1.0` is pushed.
+The repository includes a GitHub Actions workflow that builds release artifacts for macOS ARM64, macOS Intel, and Windows x64 when a version tag such as `v0.1.1` is pushed.
+
+## Real Codex CLI smoke test
+
+After installing the app and writing Codex config from the UI:
+
+```bash
+NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 scripts/codex-smoke.sh
+```
+
+The script prefers `/Applications/Codex.app/Contents/Resources/codex` and falls back to `codex` on `PATH`.

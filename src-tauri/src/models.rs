@@ -33,6 +33,8 @@ pub struct GatewayConfig {
     pub port: u16,
     pub require_local_token: bool,
     pub request_timeout_secs: u64,
+    pub stream_idle_timeout_secs: u64,
+    pub max_request_body_mb: u64,
 }
 
 impl Default for GatewayConfig {
@@ -41,7 +43,9 @@ impl Default for GatewayConfig {
             host: "127.0.0.1".to_string(),
             port: 14555,
             require_local_token: false,
-            request_timeout_secs: 120,
+            request_timeout_secs: 300,
+            stream_idle_timeout_secs: 300,
+            max_request_body_mb: 512,
         }
     }
 }
@@ -96,7 +100,7 @@ impl ProviderConfig {
             base_url: base_url.to_string(),
             api_key: String::new(),
             enabled: false,
-            timeout_secs: 120,
+            timeout_secs: 300,
             headers: BTreeMap::new(),
             query: BTreeMap::new(),
             quota: None,
@@ -228,6 +232,9 @@ pub struct RequestLogEntry {
     pub latency_ms: u128,
     pub attempts: usize,
     pub streamed: bool,
+    pub body_size_bytes: Option<u64>,
+    pub failover_reason: Option<String>,
+    pub local_rejected: bool,
     pub error: Option<String>,
     pub usage: Option<Value>,
 }
@@ -246,6 +253,9 @@ impl Default for RequestLogEntry {
             latency_ms: 0,
             attempts: 0,
             streamed: false,
+            body_size_bytes: None,
+            failover_reason: None,
+            local_rejected: false,
             error: None,
             usage: None,
         }
@@ -306,6 +316,22 @@ pub struct QuotaResult {
     pub status: Option<u16>,
     pub error: Option<String>,
     pub raw: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GatewaySelfCheckItem {
+    pub name: String,
+    pub ok: bool,
+    pub status: Option<u16>,
+    pub latency_ms: u128,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GatewaySelfCheckResult {
+    pub ok: bool,
+    pub message: String,
+    pub checks: Vec<GatewaySelfCheckItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

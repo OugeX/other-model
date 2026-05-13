@@ -130,7 +130,7 @@ export default function App() {
         {tab === 'quota' && <Quota providers={providers} busy={busy} runBusy={runBusy} />}
         {tab === 'logs' && <Logs logs={logs} />}
         {tab === 'codex' && <Codex models={gptModels.map((m) => m.id)} status={status} busy={busy} runBusy={runBusy} notify={notify} />}
-        {tab === 'settings' && <Settings config={config} setConfig={setConfig} providers={providers} busy={busy} runBusy={runBusy} />}
+        {tab === 'settings' && <Settings config={config} setConfig={setConfig} providers={providers} defaultModel={gptModels[0]?.id} busy={busy} runBusy={runBusy} notify={notify} />}
       </main>
       {popup && <TotalPopup popup={popup} onClose={() => setPopup(null)} />}
     </div>
@@ -353,7 +353,7 @@ function ProviderEditor({ provider, onClose, runBusy }: { provider: ProviderConf
         <label>API Key<input value={draft.api_key} type="password" onChange={(e) => setDraft({ ...draft, api_key: e.target.value })} /></label>
         <div className="form-row">
           <label><input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} /> 启用</label>
-          <label>超时秒<input type="number" value={draft.timeout_secs} onChange={(e) => setDraft({ ...draft, timeout_secs: Number(e.target.value) || 120 })} /></label>
+          <label>超时秒<input type="number" value={draft.timeout_secs} onChange={(e) => setDraft({ ...draft, timeout_secs: Number(e.target.value) || 300 })} /></label>
         </div>
         <details>
           <summary>额度接口（可选）</summary>
@@ -490,14 +490,14 @@ function Logs({ logs }: { logs: RequestLogEntry[] }) {
   return (
     <section className="card table-card">
       <table>
-        <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>模型</th><th>供应商</th><th>状态</th><th>耗时</th><th>错误</th></tr></thead>
+        <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>模型</th><th>供应商</th><th>状态</th><th>大小</th><th>耗时</th><th>错误 / 切换原因</th></tr></thead>
         <tbody>
           {pageItems.map((l) => (
             <tr key={l.id}>
-              <td>{new Date(l.timestamp).toLocaleString()}</td><td>{l.method}</td><td><code>{l.path}</code></td><td>{l.model ?? '-'}</td><td>{l.provider_name ?? '-'}</td><td>{l.status ?? '-'}</td><td>{l.latency_ms}ms</td><td className="truncate">{l.error ?? '-'}</td>
+              <td>{new Date(l.timestamp).toLocaleString()}</td><td>{l.method}</td><td><code>{l.path}</code></td><td>{l.model ?? '-'}</td><td>{l.provider_name ?? (l.local_rejected ? '本地拒绝' : '-')}</td><td>{l.status ?? '-'}</td><td>{formatBytes(l.body_size_bytes)}</td><td>{l.latency_ms}ms</td><td className="truncate">{l.error ?? l.failover_reason ?? '-'}</td>
             </tr>
           ))}
-          {!logs.length && <tr><td colSpan={8}>暂无请求日志。</td></tr>}
+          {!logs.length && <tr><td colSpan={9}>暂无请求日志。</td></tr>}
         </tbody>
       </table>
       <Pagination page={page} total={logs.length} onPageChange={setPage} />
@@ -548,7 +548,23 @@ function Codex({ models, status, busy, runBusy, notify }: { models: string[]; st
   );
 }
 
-function Settings({ config, setConfig, providers, busy, runBusy }: { config: AppConfig | null; setConfig: (cfg: AppConfig) => void; providers: ProviderView[]; busy: boolean; runBusy: BusyRunner }) {
+function Settings({
+  config,
+  setConfig,
+  providers,
+  defaultModel,
+  busy,
+  runBusy,
+  notify,
+}: {
+  config: AppConfig | null;
+  setConfig: (cfg: AppConfig) => void;
+  providers: ProviderView[];
+  defaultModel?: string;
+  busy: boolean;
+  runBusy: BusyRunner;
+  notify: Notify;
+}) {
   const [dir, setDir] = useState('');
   useEffect(() => { api.appDataDir().then(setDir).catch(() => undefined); }, []);
   if (!config) return <div className="card">配置仅在 Tauri App 内可用。</div>;
@@ -562,6 +578,9 @@ function Settings({ config, setConfig, providers, busy, runBusy }: { config: App
         <div className="form-row">
           <label>Host<input value={config.gateway.host} onChange={(e) => update({ gateway: { ...config.gateway, host: e.target.value } })} /></label>
           <label>Port<input type="number" value={config.gateway.port} onChange={(e) => update({ gateway: { ...config.gateway, port: Number(e.target.value) || 14555 } })} /></label>
+          <label>非流式超时秒<input type="number" value={config.gateway.request_timeout_secs} onChange={(e) => update({ gateway: { ...config.gateway, request_timeout_secs: Number(e.target.value) || 300 } })} /></label>
+          <label>流式闲置超时秒<input type="number" value={config.gateway.stream_idle_timeout_secs} onChange={(e) => update({ gateway: { ...config.gateway, stream_idle_timeout_secs: Number(e.target.value) || 300 } })} /></label>
+          <label>最大请求体 MB<input type="number" value={config.gateway.max_request_body_mb} onChange={(e) => update({ gateway: { ...config.gateway, max_request_body_mb: Number(e.target.value) || 512 } })} /></label>
           <label>最大重试<input type="number" value={config.routing.max_attempts_per_request} onChange={(e) => update({ routing: { ...config.routing, max_attempts_per_request: Number(e.target.value) || 1 } })} /></label>
           <label>冷却秒<input type="number" value={config.routing.cooldown_secs} onChange={(e) => update({ routing: { ...config.routing, cooldown_secs: Number(e.target.value) || 60 } })} /></label>
         </div>
@@ -580,7 +599,22 @@ function Settings({ config, setConfig, providers, busy, runBusy }: { config: App
         <label><input type="checkbox" checked={config.routing.auto_failover ?? true} onChange={(e) => update({ routing: { ...config.routing, auto_failover: e.target.checked } })} /> 自动切换供应商（开启后上游 401/402/429/5xx/模型错误会尝试下一个）</label>
         <label><input type="checkbox" checked={config.gateway.require_local_token} onChange={(e) => update({ gateway: { ...config.gateway, require_local_token: e.target.checked } })} /> 要求本地 Authorization token</label>
         <label>本地 Token<input value={config.local_auth_token} onChange={(e) => update({ local_auth_token: e.target.value })} /></label>
-        <button disabled={busy} onClick={() => runBusy(() => api.saveConfig(config).then(setConfig), '设置已保存，重启网关后端口变更生效')}>保存设置</button>
+        <div className="section-actions">
+          <button disabled={busy} onClick={() => runBusy(() => api.saveConfig(config).then(setConfig), '设置已保存，重启网关后端口/请求体限制变更生效')}>保存设置</button>
+          <button
+            disabled={busy}
+            onClick={() => runBusy(async () => {
+              const result = await api.selfCheck(defaultModel);
+              notify({
+                title: result.ok ? '网关自检通过' : '网关自检发现问题',
+                message: result.message,
+                tone: result.ok ? 'success' : 'warning',
+                manual: true,
+                details: result.checks.map((item) => `${item.ok ? '✓' : '✗'} ${item.name} ${item.status ? `HTTP ${item.status}` : ''} ${item.latency_ms}ms\n${item.details ?? ''}`).join('\n\n'),
+              });
+            })}
+          >一键网关自检</button>
+        </div>
       </div>
     </section>
   );
@@ -588,4 +622,11 @@ function Settings({ config, setConfig, providers, busy, runBusy }: { config: App
 
 function formatError(err: unknown) {
   return err instanceof Error ? err.message : String(err);
+}
+
+function formatBytes(value?: number | null) {
+  if (!value) return '-';
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }

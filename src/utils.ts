@@ -6,7 +6,7 @@ export const newProvider = (): ProviderConfig => ({
   base_url: 'https://api.openai.com/v1',
   api_key: '',
   enabled: true,
-  timeout_secs: 120,
+  timeout_secs: 300,
   headers: {},
   query: {},
   quota: null,

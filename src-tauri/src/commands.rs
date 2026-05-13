@@ -2,9 +2,10 @@ use crate::{
     codex_config,
     gateway::{is_gpt_model, GatewayManager},
     models::{
-        AppConfig, CodexConfigResult, ConfigureCodexRequest, GatewayStatus, ModelInfo, ModelsCache,
-        ProviderConfig, ProviderExportResult, ProviderImportResult, ProviderState, ProviderView,
-        QuotaResult, RequestLogEntry, TestResult,
+        AppConfig, CodexConfigResult, ConfigureCodexRequest, GatewaySelfCheckItem,
+        GatewaySelfCheckResult, GatewayStatus, ModelInfo, ModelsCache, ProviderConfig,
+        ProviderExportResult, ProviderImportResult, ProviderState, ProviderView, QuotaResult,
+        RequestLogEntry, TestResult,
     },
     quota,
     storage::Storage,
@@ -12,7 +13,10 @@ use crate::{
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    time::Instant,
+};
 use tauri::State;
 
 #[derive(Clone)]
@@ -169,7 +173,10 @@ async fn export_providers_to_dir(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| storage.dir());
     if !dir.exists() {
-        return Err(anyhow!("export directory does not exist: {}", dir.display()));
+        return Err(anyhow!(
+            "export directory does not exist: {}",
+            dir.display()
+        ));
     }
     if !dir.is_dir() {
         return Err(anyhow!("export path is not a directory: {}", dir.display()));
@@ -303,6 +310,227 @@ pub async fn get_logs(
 }
 
 #[tauri::command]
+pub async fn run_gateway_self_check(
+    state: State<'_, AppState>,
+    model: Option<String>,
+) -> Result<GatewaySelfCheckResult, String> {
+    let mut checks = Vec::<GatewaySelfCheckItem>::new();
+    let mut status = state.gateway.status().await;
+    if !status.running {
+        let start = Instant::now();
+        match state.gateway.start().await {
+            Ok(next) => {
+                status = next;
+                checks.push(GatewaySelfCheckItem {
+                    name: "启动网关".to_string(),
+                    ok: true,
+                    status: None,
+                    latency_ms: start.elapsed().as_millis(),
+                    details: Some(format!("已启动：{}", status.bind_url)),
+                });
+            }
+            Err(err) => {
+                checks.push(GatewaySelfCheckItem {
+                    name: "启动网关".to_string(),
+                    ok: false,
+                    status: None,
+                    latency_ms: start.elapsed().as_millis(),
+                    details: Some(err.to_string()),
+                });
+                return Ok(finish_self_check(checks));
+            }
+        }
+    }
+
+    let cfg = state.storage.config().await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(
+            cfg.gateway.request_timeout_secs.max(30),
+        ))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let auth_header = cfg
+        .gateway
+        .require_local_token
+        .then(|| format!("Bearer {}", cfg.local_auth_token));
+    let base = status.bind_url.trim_end_matches('/').to_string();
+    let root = base.trim_end_matches("/v1").to_string();
+
+    let start = Instant::now();
+    match client.get(format!("{root}/health")).send().await {
+        Ok(resp) => checks.push(GatewaySelfCheckItem {
+            name: "健康检查".to_string(),
+            ok: resp.status().is_success(),
+            status: Some(resp.status().as_u16()),
+            latency_ms: start.elapsed().as_millis(),
+            details: Some("GET /health".to_string()),
+        }),
+        Err(err) => checks.push(GatewaySelfCheckItem {
+            name: "健康检查".to_string(),
+            ok: false,
+            status: None,
+            latency_ms: start.elapsed().as_millis(),
+            details: Some(err.to_string()),
+        }),
+    }
+
+    let start = Instant::now();
+    let mut req = client.get(format!("{base}/models"));
+    if let Some(auth) = &auth_header {
+        req = req.header(reqwest::header::AUTHORIZATION, auth);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status_code = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            checks.push(GatewaySelfCheckItem {
+                name: "模型列表".to_string(),
+                ok: status_code.is_success(),
+                status: Some(status_code.as_u16()),
+                latency_ms: start.elapsed().as_millis(),
+                details: Some(text.chars().take(300).collect()),
+            });
+        }
+        Err(err) => checks.push(GatewaySelfCheckItem {
+            name: "模型列表".to_string(),
+            ok: false,
+            status: None,
+            latency_ms: start.elapsed().as_millis(),
+            details: Some(err.to_string()),
+        }),
+    }
+
+    let selected_model = if let Some(model) = model.filter(|item| !item.trim().is_empty()) {
+        Some(model)
+    } else {
+        let cache = state.storage.models_cache().await;
+        first_cached_gpt_model(&cache)
+    };
+    if let Some(model) = selected_model {
+        let small_body = serde_json::json!({
+            "model": model.clone(),
+            "input": "ping",
+            "max_output_tokens": 16,
+            "stream": false
+        });
+        let start = Instant::now();
+        let mut req = client.post(format!("{base}/responses")).json(&small_body);
+        if let Some(auth) = &auth_header {
+            req = req.header(reqwest::header::AUTHORIZATION, auth);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status_code = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                checks.push(GatewaySelfCheckItem {
+                    name: "Responses 小请求".to_string(),
+                    ok: status_code.is_success(),
+                    status: Some(status_code.as_u16()),
+                    latency_ms: start.elapsed().as_millis(),
+                    details: Some(text.chars().take(500).collect()),
+                });
+            }
+            Err(err) => checks.push(GatewaySelfCheckItem {
+                name: "Responses 小请求".to_string(),
+                ok: false,
+                status: None,
+                latency_ms: start.elapsed().as_millis(),
+                details: Some(err.to_string()),
+            }),
+        }
+
+        let large_input = "x".repeat(3 * 1024 * 1024);
+        let large_body = serde_json::json!({
+            "model": model.clone(),
+            "input": large_input,
+            "max_output_tokens": 1,
+            "stream": false
+        });
+        let start = Instant::now();
+        let mut req = client.post(format!("{base}/responses")).json(&large_body);
+        if let Some(auth) = &auth_header {
+            req = req.header(reqwest::header::AUTHORIZATION, auth);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status_code = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                let local_limit_rejected = status_code == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+                    && text.contains("local gateway request body is too large");
+                checks.push(GatewaySelfCheckItem {
+                    name: "2MB+ 大请求通道".to_string(),
+                    ok: !local_limit_rejected,
+                    status: Some(status_code.as_u16()),
+                    latency_ms: start.elapsed().as_millis(),
+                    details: Some(if local_limit_rejected {
+                        text.chars().take(500).collect()
+                    } else {
+                        "本地网关已接收大请求；后续状态来自上游供应商。".to_string()
+                    }),
+                });
+            }
+            Err(err) => checks.push(GatewaySelfCheckItem {
+                name: "2MB+ 大请求通道".to_string(),
+                ok: false,
+                status: None,
+                latency_ms: start.elapsed().as_millis(),
+                details: Some(err.to_string()),
+            }),
+        }
+
+        let stream_body = serde_json::json!({
+            "model": model.clone(),
+            "input": "stream ping",
+            "max_output_tokens": 16,
+            "stream": true
+        });
+        let start = Instant::now();
+        let mut req = client.post(format!("{base}/responses")).json(&stream_body);
+        if let Some(auth) = &auth_header {
+            req = req.header(reqwest::header::AUTHORIZATION, auth);
+        }
+        match req.send().await {
+            Ok(resp) => checks.push(GatewaySelfCheckItem {
+                name: "SSE 流式请求".to_string(),
+                ok: resp.status().is_success(),
+                status: Some(resp.status().as_u16()),
+                latency_ms: start.elapsed().as_millis(),
+                details: Some("已成功打开流式响应。".to_string()),
+            }),
+            Err(err) => checks.push(GatewaySelfCheckItem {
+                name: "SSE 流式请求".to_string(),
+                ok: false,
+                status: None,
+                latency_ms: start.elapsed().as_millis(),
+                details: Some(err.to_string()),
+            }),
+        }
+    } else {
+        checks.push(GatewaySelfCheckItem {
+            name: "Responses 请求".to_string(),
+            ok: true,
+            status: None,
+            latency_ms: 0,
+            details: Some("跳过：未发现 GPT 模型，请先在供应商页查询模型。".to_string()),
+        });
+    }
+
+    checks.push(GatewaySelfCheckItem {
+        name: "Failover 配置".to_string(),
+        ok: !cfg.routing.auto_failover || status.enabled_provider_count > 1,
+        status: None,
+        latency_ms: 0,
+        details: Some(format!(
+            "auto_failover={}，启用供应商={}",
+            cfg.routing.auto_failover, status.enabled_provider_count
+        )),
+    });
+
+    Ok(finish_self_check(checks))
+}
+
+#[tauri::command]
 pub async fn configure_codex(
     state: State<'_, AppState>,
     request: ConfigureCodexRequest,
@@ -390,6 +618,35 @@ fn parse_provider_import(raw: &str) -> Result<Vec<ProviderConfig>> {
     ))
 }
 
+fn first_cached_gpt_model(cache: &ModelsCache) -> Option<String> {
+    let mut models = BTreeMap::<String, ()>::new();
+    for provider in cache.providers.values() {
+        for model in &provider.models {
+            if is_gpt_model(&model.id) {
+                models.insert(model.id.clone(), ());
+            }
+        }
+    }
+    models.into_keys().next()
+}
+
+fn finish_self_check(checks: Vec<GatewaySelfCheckItem>) -> GatewaySelfCheckResult {
+    let failed = checks.iter().filter(|item| !item.ok).count();
+    GatewaySelfCheckResult {
+        ok: failed == 0,
+        message: if failed == 0 {
+            format!("自检完成：{} 项全部通过。", checks.len())
+        } else {
+            format!(
+                "自检完成：{} 项通过，{} 项失败。",
+                checks.len() - failed,
+                failed
+            )
+        },
+        checks,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,12 +697,10 @@ mod tests {
         let storage = Storage::load_from_dir(storage_dir.path().to_path_buf())
             .await
             .unwrap();
-        let result = export_providers_to_dir(
-            storage,
-            Some(export_dir.path().display().to_string()),
-        )
-        .await
-        .unwrap();
+        let result =
+            export_providers_to_dir(storage, Some(export_dir.path().display().to_string()))
+                .await
+                .unwrap();
         assert!(result.ok);
         assert!(result.path.contains("other-model-providers-"));
         assert!(std::path::Path::new(&result.path).exists());
@@ -473,6 +728,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         test_provider,
         get_quota,
         get_logs,
+        run_gateway_self_check,
         configure_codex,
         restore_codex_backup,
         get_codex_config_path,

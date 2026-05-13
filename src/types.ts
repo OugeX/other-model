@@ -5,6 +5,8 @@ export interface GatewayConfig {
   port: number;
   require_local_token: boolean;
   request_timeout_secs: number;
+  stream_idle_timeout_secs: number;
+  max_request_body_mb: number;
 }
 
 export interface RoutingConfig {
@@ -115,6 +117,9 @@ export interface RequestLogEntry {
   latency_ms: number;
   attempts: number;
   streamed: boolean;
+  body_size_bytes?: number | null;
+  failover_reason?: string | null;
+  local_rejected?: boolean;
   error?: string | null;
   usage?: unknown;
 }
@@ -137,6 +142,20 @@ export interface QuotaResult {
   status?: number | null;
   error?: string | null;
   raw?: unknown;
+}
+
+export interface GatewaySelfCheckItem {
+  name: string;
+  ok: boolean;
+  status?: number | null;
+  latency_ms: number;
+  details?: string | null;
+}
+
+export interface GatewaySelfCheckResult {
+  ok: boolean;
+  message: string;
+  checks: GatewaySelfCheckItem[];
 }
 
 export interface CodexConfigResult {

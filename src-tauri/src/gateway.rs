@@ -6,9 +6,9 @@ use crate::storage::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_stream::stream;
 use axum::{
-    body::{Body, Bytes},
+    body::{to_bytes, Body, Bytes},
     extract::{Path, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, post},
     Json, Router,
@@ -215,7 +215,8 @@ impl GatewayManager {
         let url = join_url(&provider.base_url, "models");
         let start = Instant::now();
         let resp = self
-            .client_for_provider(provider)?
+            .client_for_provider(provider)
+            .await?
             .get(url)
             .bearer_auth(&provider.api_key)
             .send()
@@ -289,6 +290,7 @@ impl GatewayManager {
         let url = join_url(&provider.base_url, "responses");
         match self
             .client_for_provider(&provider)
+            .await
             .map(|c| c.post(url).bearer_auth(&provider.api_key).json(&body))
         {
             Ok(req) => match req.send().await {
@@ -356,11 +358,29 @@ impl GatewayManager {
         }
     }
 
-    fn client_for_provider(&self, provider: &ProviderConfig) -> Result<Client> {
+    async fn client_for_provider(&self, provider: &ProviderConfig) -> Result<Client> {
+        let cfg = self.inner.storage.config().await;
+        let timeout_secs = provider
+            .timeout_secs
+            .max(cfg.gateway.request_timeout_secs)
+            .max(1);
         Ok(Client::builder()
             .pool_idle_timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(provider.timeout_secs.max(1)))
+            .timeout(Duration::from_secs(timeout_secs))
+            .no_proxy()
+            .build()?)
+    }
+
+    async fn stream_client_for_provider(&self, _provider: &ProviderConfig) -> Result<Client> {
+        let cfg = self.inner.storage.config().await;
+        Ok(Client::builder()
+            .pool_idle_timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(
+                cfg.gateway.stream_idle_timeout_secs.max(1),
+            ))
+            .no_proxy()
             .build()?)
     }
 
@@ -403,7 +423,11 @@ impl GatewayManager {
             }
         }
         if !auto_round_robin {
-            if let Some(id) = selected_provider_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+            if let Some(id) = selected_provider_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
                 if let Some(index) = providers.iter().position(|p| p.id == id) {
                     return providers
                         .iter()
@@ -429,6 +453,118 @@ impl GatewayManager {
             .collect()
     }
 
+    async fn proxy_http_request(
+        &self,
+        method: Method,
+        path: String,
+        request: Request<Body>,
+        forced_provider_id: Option<String>,
+    ) -> Response {
+        let started = Instant::now();
+        let headers = request.headers().clone();
+        if let Err(resp) = self.authorize_local(&headers).await {
+            let mut log = RequestLogEntry {
+                method: method.to_string(),
+                path: format!("/v1/{path}"),
+                status: Some(StatusCode::UNAUTHORIZED.as_u16()),
+                latency_ms: started.elapsed().as_millis(),
+                body_size_bytes: content_length(&headers),
+                local_rejected: true,
+                error: Some("local gateway authorization failed".to_string()),
+                ..Default::default()
+            };
+            log.streamed = false;
+            let _ = self.inner.storage.append_log(&log).await;
+            return resp;
+        }
+
+        let cfg = self.inner.storage.config().await;
+        let limit = max_request_body_bytes(cfg.gateway.max_request_body_mb);
+        if let Some(size) = content_length(&headers) {
+            if size > limit as u64 {
+                return self
+                    .reject_large_body(method, path, headers, started, size, limit, None)
+                    .await;
+            }
+        }
+
+        match to_bytes(request.into_body(), limit).await {
+            Ok(body) => {
+                self.proxy_request(method, path, headers, body, forced_provider_id)
+                    .await
+            }
+            Err(err) => {
+                let err_text = err.to_string();
+                let status = if err_text.contains("length limit exceeded") {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    let size = content_length(&headers).unwrap_or(limit as u64 + 1);
+                    self.reject_large_body(
+                        method,
+                        path,
+                        headers,
+                        started,
+                        size,
+                        limit,
+                        Some(err_text),
+                    )
+                    .await
+                } else {
+                    let mut log = RequestLogEntry {
+                        method: method.to_string(),
+                        path: format!("/v1/{path}"),
+                        status: Some(status.as_u16()),
+                        latency_ms: started.elapsed().as_millis(),
+                        body_size_bytes: content_length(&headers),
+                        local_rejected: true,
+                        error: Some(format!("failed to read request body: {err_text}")),
+                        ..Default::default()
+                    };
+                    log.streamed = false;
+                    let _ = self.inner.storage.append_log(&log).await;
+                    json_error(status, &format!("failed to read request body: {err_text}"))
+                }
+            }
+        }
+    }
+
+    async fn reject_large_body(
+        &self,
+        method: Method,
+        path: String,
+        _headers: HeaderMap,
+        started: Instant,
+        size: u64,
+        limit: usize,
+        source_error: Option<String>,
+    ) -> Response {
+        let message = format!(
+            "local gateway request body is too large: received at least {} bytes, limit is {} bytes ({} MB). Increase Settings → Max request body MB if needed.",
+            size,
+            limit,
+            limit / 1024 / 1024
+        );
+        let mut log = RequestLogEntry {
+            method: method.to_string(),
+            path: format!("/v1/{path}"),
+            status: Some(StatusCode::PAYLOAD_TOO_LARGE.as_u16()),
+            latency_ms: started.elapsed().as_millis(),
+            body_size_bytes: Some(size),
+            local_rejected: true,
+            error: Some(match source_error {
+                Some(err) => format!("{message}; extractor error: {err}"),
+                None => message.clone(),
+            }),
+            ..Default::default()
+        };
+        log.streamed = false;
+        let _ = self.inner.storage.append_log(&log).await;
+        json_error(StatusCode::PAYLOAD_TOO_LARGE, &message)
+    }
+
     async fn proxy_request(
         &self,
         method: Method,
@@ -445,6 +581,7 @@ impl GatewayManager {
             path: format!("/v1/{path}"),
             model,
             streamed,
+            body_size_bytes: Some(body.len() as u64),
             ..Default::default()
         };
         eprintln!(
@@ -458,6 +595,8 @@ impl GatewayManager {
         );
         if let Err(resp) = self.authorize_local(&headers).await {
             log.error = Some("local gateway authorization failed".to_string());
+            log.status = Some(StatusCode::UNAUTHORIZED.as_u16());
+            log.local_rejected = true;
             log.latency_ms = started.elapsed().as_millis();
             let _ = self.inner.storage.append_log(&log).await;
             eprintln!("apidev gateway auth failed id={}", log.id);
@@ -517,10 +656,12 @@ impl GatewayManager {
                     log.latency_ms = started.elapsed().as_millis();
                     log.error = attempt.error.clone();
                     if let Some(status) = attempt.status {
-                        if auto_failover && should_failover_status(status) {
-                            let err = attempt.error.unwrap_or_else(|| {
+                        if auto_failover && should_failover_status(status, attempt.error.as_deref())
+                        {
+                            let err = attempt.error.clone().unwrap_or_else(|| {
                                 format!("upstream returned {}", status.as_u16())
                             });
+                            log.failover_reason = Some(err.clone());
                             let _ = self
                                 .record_provider_failure(
                                     &provider,
@@ -532,6 +673,7 @@ impl GatewayManager {
                             continue;
                         }
                         if status.is_success() {
+                            log.error = None;
                             let _ = self
                                 .record_provider_success(
                                     &provider,
@@ -617,8 +759,9 @@ impl GatewayManager {
                         opened.status.as_u16(),
                         opened.headers.get(http::header::CONTENT_TYPE)
                     );
-                    if auto_failover && should_failover_status(opened.status) {
+                    if !opened.status.is_success() {
                         let status = opened.status;
+                        let headers = opened.headers.clone();
                         let text = opened.response.text().await.unwrap_or_default();
                         let err = format!(
                             "upstream {} returned {} before stream output: {}",
@@ -629,25 +772,27 @@ impl GatewayManager {
                         let _ = self
                             .record_provider_failure(&provider, Some(status.as_u16()), err.clone())
                             .await;
-                        last_error = Some(err);
-                        continue;
+                        if auto_failover && should_failover_status(status, Some(&text)) {
+                            log.failover_reason = Some(err.clone());
+                            last_error = Some(err);
+                            continue;
+                        }
+                        let mut stream_log = log.clone();
+                        stream_log.provider_id = Some(provider.id.clone());
+                        stream_log.provider_name = Some(provider.name.clone());
+                        stream_log.status = Some(status.as_u16());
+                        stream_log.latency_ms = started.elapsed().as_millis();
+                        stream_log.error = Some(err);
+                        let _ = self.inner.storage.append_log(&stream_log).await;
+                        let body = Bytes::from(text);
+                        let headers = sanitize_response_headers(headers, body.len());
+                        return (status, headers, body).into_response();
                     }
                     let mut stream_log = log.clone();
                     stream_log.provider_id = Some(opened.provider.id.clone());
                     stream_log.provider_name = Some(opened.provider.name.clone());
                     stream_log.status = Some(opened.status.as_u16());
                     stream_log.latency_ms = started.elapsed().as_millis();
-                    if !opened.status.is_success() {
-                        stream_log.error =
-                            Some(format!("upstream returned {}", opened.status.as_u16()));
-                        let _ = self
-                            .record_provider_failure(
-                                &opened.provider,
-                                Some(opened.status.as_u16()),
-                                stream_log.error.clone().unwrap_or_default(),
-                            )
-                            .await;
-                    }
                     return self
                         .stream_opened_upstream(opened, stream_log, started)
                         .await;
@@ -684,7 +829,7 @@ impl GatewayManager {
         body: Bytes,
     ) -> Result<UpstreamStreamResult> {
         let start = Instant::now();
-        let client = self.client_for_provider(provider)?;
+        let client = self.stream_client_for_provider(provider).await?;
         let url = join_url(&provider.base_url, path);
         let mut req = client
             .request(method.clone(), url)
@@ -717,7 +862,7 @@ impl GatewayManager {
         body: Bytes,
     ) -> Result<UpstreamAttempt> {
         let start = Instant::now();
-        let client = self.client_for_provider(provider)?;
+        let client = self.client_for_provider(provider).await?;
         let url = join_url(&provider.base_url, path);
         let mut req = client
             .request(method.clone(), url)
@@ -738,7 +883,7 @@ impl GatewayManager {
             .unwrap_or_default()
             .to_ascii_lowercase();
         let streamed = content_type.contains("text/event-stream");
-        if streamed && !should_failover_status(status) {
+        if streamed && status.is_success() {
             Ok(UpstreamAttempt {
                 status: Some(status),
                 latency_ms: start.elapsed().as_millis(),
@@ -1023,44 +1168,31 @@ async fn get_model_handler(
 
 async fn responses_handler(
     State(state): State<GatewayAppState>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: Request<Body>,
 ) -> Response {
     state
         .manager
-        .proxy_request(Method::POST, "responses".to_string(), headers, body, None)
+        .proxy_http_request(Method::POST, "responses".to_string(), request, None)
         .await
 }
 
 async fn chat_completions_handler(
     State(state): State<GatewayAppState>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: Request<Body>,
 ) -> Response {
     state
         .manager
-        .proxy_request(
-            Method::POST,
-            "chat/completions".to_string(),
-            headers,
-            body,
-            None,
-        )
+        .proxy_http_request(Method::POST, "chat/completions".to_string(), request, None)
         .await
 }
 
-async fn proxy_handler(
-    State(state): State<GatewayAppState>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let path = uri.path().trim_start_matches("/v1/").to_string();
+async fn proxy_handler(State(state): State<GatewayAppState>, request: Request<Body>) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().trim_start_matches("/v1/").to_string();
     let forced = state.manager.provider_for_response_path(&path).await;
     state
         .manager
-        .proxy_request(method, path, headers, body, forced)
+        .proxy_http_request(method, path, request, forced)
         .await
 }
 
@@ -1077,14 +1209,44 @@ pub fn join_url(base: &str, path: &str) -> String {
     )
 }
 
-fn should_failover_status(status: StatusCode) -> bool {
+fn should_failover_status(status: StatusCode, body_preview: Option<&str>) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::PAYMENT_REQUIRED
         || status == StatusCode::UNAUTHORIZED
         || status == StatusCode::FORBIDDEN
+        || status == StatusCode::PAYLOAD_TOO_LARGE
         || status.is_server_error()
-        || status == StatusCode::NOT_FOUND
-        || status == StatusCode::BAD_REQUEST
+        || (matches!(status, StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST)
+            && looks_like_model_routing_error(body_preview.unwrap_or_default()))
+}
+
+fn looks_like_model_routing_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_model = lower.contains("model")
+        || lower.contains("模型")
+        || lower.contains("deployment")
+        || lower.contains("engine");
+    has_model
+        && (lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("not exist")
+            || lower.contains("not supported")
+            || lower.contains("unsupported")
+            || lower.contains("不存在")
+            || lower.contains("不支持")
+            || lower.contains("无效"))
+}
+
+fn max_request_body_bytes(max_request_body_mb: u64) -> usize {
+    let bytes = max_request_body_mb.max(1).saturating_mul(1024 * 1024);
+    bytes.min(usize::MAX as u64) as usize
+}
+
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 fn extract_model_from_body(body: &[u8]) -> Option<String> {
@@ -1298,9 +1460,7 @@ mod tests {
         models::{AppConfig, GatewayConfig, RoutingConfig},
         storage::Storage,
     };
-    use axum::body::to_bytes;
     use http::header::AUTHORIZATION;
-    use tempfile::tempdir;
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
@@ -1450,7 +1610,6 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("boom"));
     }
 
-
     #[tokio::test]
     async fn selected_provider_is_primary_when_round_robin_disabled() {
         let upstream_a = upstream_json(200, json!({"id": "resp_a", "object": "response"})).await;
@@ -1521,6 +1680,194 @@ mod tests {
         assert_eq!(request_count(&upstream_b).await, 2);
     }
 
+    #[tokio::test]
+    async fn upstream_413_failovers_when_enabled() {
+        let too_large =
+            upstream_json(413, json!({"error": {"message": "payload too large"}})).await;
+        let healthy = upstream_json(200, json!({"id": "resp_ok", "object": "response"})).await;
+
+        let manager = test_manager(
+            &too_large,
+            &healthy,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                auth_headers(),
+                Bytes::from_static(br#"{"model":"gpt-test","input":"ping"}"#),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_count(&too_large).await, 1);
+        assert_eq!(request_count(&healthy).await, 1);
+    }
+
+    #[tokio::test]
+    async fn bad_request_only_failovers_for_model_routing_errors() {
+        let invalid_body =
+            upstream_json(400, json!({"error": {"message": "input is required"}})).await;
+        let healthy = upstream_json(200, json!({"id": "resp_ok", "object": "response"})).await;
+        let manager = test_manager(
+            &invalid_body,
+            &healthy,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                auth_headers(),
+                Bytes::from_static(br#"{"model":"gpt-test"}"#),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(request_count(&invalid_body).await, 1);
+        assert_eq!(request_count(&healthy).await, 0);
+
+        let model_missing = upstream_json(
+            400,
+            json!({"error": {"message": "model gpt-test does not exist"}}),
+        )
+        .await;
+        let healthy = upstream_json(200, json!({"id": "resp_ok", "object": "response"})).await;
+        let manager = test_manager(
+            &model_missing,
+            &healthy,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                auth_headers(),
+                Bytes::from_static(br#"{"model":"gpt-test","input":"ping"}"#),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_count(&model_missing).await, 1);
+        assert_eq!(request_count(&healthy).await, 1);
+    }
+
+    #[tokio::test]
+    async fn http_gateway_accepts_large_bodies_above_axum_default() {
+        let upstream_a =
+            upstream_json(200, json!({"id": "resp_large", "object": "response"})).await;
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(
+            &upstream_a,
+            &upstream_b,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+        manager
+            .inner
+            .storage
+            .update_config(|cfg| {
+                cfg.gateway.require_local_token = false;
+                cfg.gateway.max_request_body_mb = 16;
+            })
+            .await
+            .unwrap();
+        let status = manager.start().await.unwrap();
+        let payload = json!({
+            "model": "gpt-test",
+            "input": "x".repeat(3 * 1024 * 1024),
+            "max_output_tokens": 1
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/responses", status.bind_url))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(request_count(&upstream_a).await, 1);
+        let _ = manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn http_gateway_returns_structured_local_413_when_config_limit_exceeded() {
+        let upstream_a =
+            upstream_json(200, json!({"id": "resp_large", "object": "response"})).await;
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(
+            &upstream_a,
+            &upstream_b,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+        manager
+            .inner
+            .storage
+            .update_config(|cfg| {
+                cfg.gateway.require_local_token = false;
+                cfg.gateway.max_request_body_mb = 1;
+            })
+            .await
+            .unwrap();
+        let status = manager.start().await.unwrap();
+        let payload = json!({
+            "model": "gpt-test",
+            "input": "x".repeat(2 * 1024 * 1024),
+            "max_output_tokens": 1
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/responses", status.bind_url))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("local gateway request body is too large"));
+        assert_eq!(request_count(&upstream_a).await, 0);
+        let _ = manager.stop().await;
+    }
+
     async fn upstream_json(status: u16, body: Value) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1536,16 +1883,17 @@ mod tests {
         upstream_b: &MockServer,
         routing: RoutingConfig,
     ) -> GatewayManager {
-        let dir = tempdir().unwrap();
-        let storage = Storage::load_from_dir(dir.path().to_path_buf())
-            .await
-            .unwrap();
+        let dir = std::env::temp_dir().join(format!("other-model-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let storage = Storage::load_from_dir(dir).await.unwrap();
         let mut cfg = AppConfig::default();
         cfg.gateway = GatewayConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
             require_local_token: true,
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
+            max_request_body_mb: 512,
         };
         cfg.local_auth_token = "test-token".to_string();
         cfg.routing = routing;

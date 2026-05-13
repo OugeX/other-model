@@ -117,6 +117,21 @@ Public CI builds are currently unsigned. If macOS shows `"Other Model" is damage
 xattr -dr com.apple.quarantine "/Applications/Other Model.app"
 ```
 
+If the app was copied through WeChat or AirDrop and still shows the same dialog on Apple Silicon / M-series Macs, run the included helper after dragging the app into `/Applications`:
+
+```bash
+scripts/fix-macos-damaged-app.command
+```
+
+Or run the full manual fix:
+
+```bash
+xattr -cr "/Applications/Other Model.app"
+codesign --force --deep --sign - "/Applications/Other Model.app"
+xattr -cr "/Applications/Other Model.app"
+open "/Applications/Other Model.app"
+```
+
 For local redistribution you can also ad-hoc sign the app before packaging:
 
 ```bash

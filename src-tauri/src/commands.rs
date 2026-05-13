@@ -82,7 +82,13 @@ pub async fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderVi
             let models = cache
                 .providers
                 .get(&provider.id)
-                .map(|m| m.models.clone())
+                .map(|m| {
+                    m.models
+                        .iter()
+                        .filter(|model| is_gpt_model(&model.id))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             let gpt_model_count = models.iter().filter(|m| is_gpt_model(&m.id)).count();
             ProviderView {
@@ -255,7 +261,9 @@ pub async fn discover_models(state: State<'_, AppState>) -> Result<ModelsCache, 
 
 #[tauri::command]
 pub async fn get_models_cache(state: State<'_, AppState>) -> Result<ModelsCache, String> {
-    Ok(state.storage.models_cache().await)
+    Ok(filter_supported_models_cache(
+        state.storage.models_cache().await,
+    ))
 }
 
 #[tauri::command]
@@ -512,7 +520,7 @@ pub async fn run_gateway_self_check(
             ok: true,
             status: None,
             latency_ms: 0,
-            details: Some("跳过：未发现 GPT 模型，请先在供应商页查询模型。".to_string()),
+            details: Some("跳过：未发现 GPT-5.4 / GPT-5.5，请先在供应商页查询模型。".to_string()),
         });
     }
 
@@ -628,6 +636,13 @@ fn first_cached_gpt_model(cache: &ModelsCache) -> Option<String> {
         }
     }
     models.into_keys().next()
+}
+
+fn filter_supported_models_cache(mut cache: ModelsCache) -> ModelsCache {
+    for provider in cache.providers.values_mut() {
+        provider.models.retain(|model| is_gpt_model(&model.id));
+    }
+    cache
 }
 
 fn finish_self_check(checks: Vec<GatewaySelfCheckItem>) -> GatewaySelfCheckResult {

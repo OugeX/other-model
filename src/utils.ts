@@ -41,6 +41,7 @@ export function flattenModels(cache: { providers: Record<string, { models: { id:
   const seen = new Set<string>();
   return Object.values(cache.providers)
     .flatMap((p) => p.models)
+    .filter((m) => isGptModel(m.id))
     .filter((m) => {
       if (seen.has(m.id)) return false;
       seen.add(m.id);
@@ -50,13 +51,13 @@ export function flattenModels(cache: { providers: Record<string, { models: { id:
 }
 
 export function isGptModel(id: string) {
-  const lower = id.toLowerCase();
-  return lower.startsWith('gpt') || lower.includes('/gpt') || lower.includes('gpt-');
+  const normalized = id.trim().toLowerCase().replace(/^openai\//, '').replace(/^models\//, '');
+  return normalized === 'gpt-5.4' || normalized === 'gpt-5.5';
 }
 
 
 export function modelsForProvider(cache: { providers: Record<string, { models: { id: string }[] }> }, providerId: string) {
-  return [...(cache.providers[providerId]?.models ?? [])].sort((a, b) => {
+  return [...(cache.providers[providerId]?.models ?? [])].filter((m) => isGptModel(m.id)).sort((a, b) => {
     const ag = isGptModel(a.id) ? 0 : 1;
     const bg = isGptModel(b.id) ? 0 : 1;
     return ag - bg || a.id.localeCompare(b.id);
@@ -64,5 +65,5 @@ export function modelsForProvider(cache: { providers: Record<string, { models: {
 }
 
 export function gptModelsFromCache(cache: { providers: Record<string, { models: { id: string }[] }> }) {
-  return flattenModels(cache).filter((m) => isGptModel(m.id));
+  return flattenModels(cache);
 }

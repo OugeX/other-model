@@ -33,7 +33,7 @@ type BusyRunner = (fn: () => Promise<void>, ok?: string, popup?: Partial<TotalPo
 const tabs: { key: Tab; label: string; hint: string }[] = [
   { key: 'dashboard', label: '仪表盘', hint: '运行状态' },
   { key: 'providers', label: '供应商', hint: '增删改查' },
-  { key: 'models', label: '模型', hint: '发现/检测' },
+  { key: 'models', label: '模型', hint: '仅 GPT-5.4/5.5' },
   { key: 'quota', label: '额度', hint: '余额/健康' },
   { key: 'logs', label: '日志', hint: '请求流水' },
   { key: 'codex', label: 'Codex', hint: '一键配置' },
@@ -197,7 +197,7 @@ function Dashboard({ status, providers, models, logs }: { status: GatewayStatus 
       <Metric title="网关地址" value={status?.bind_url ?? '-'} tone={status?.running ? 'ok' : 'bad'} />
       <Metric title="启用供应商" value={`${status?.enabled_provider_count ?? 0}/${status?.provider_count ?? 0}`} tone="ok" />
       <Metric title="健康供应商" value={`${healthy}/${providers.length}`} tone={healthy ? 'ok' : 'warn'} />
-      <Metric title="GPT 模型" value={String(models)} tone="ok" />
+      <Metric title="可用模型" value={String(models)} tone="ok" />
       <div className="card wide">
         <h3>运行说明</h3>
         <p>Codex 配置为本地网关后，请求会进入本机 `/v1`，再按当前路由设置转发到上游供应商。流式请求在输出前可故障转移，输出后不重放。</p>
@@ -300,7 +300,7 @@ function Providers({ providers, cache, busy, runBusy, notify }: { providers: Pro
                   <td><code>{p.config.base_url}</code></td>
                   <td>{mask(p.config.api_key)}</td>
                   <td><span className={`pill ${healthClass(p.state.health)}`}>{healthLabel(p.state.health)}</span></td>
-                  <td>{p.gpt_model_count} GPT / {p.model_count} 全部</td>
+                  <td>{p.gpt_model_count} 个（GPT-5.4/5.5）</td>
                   <td className="truncate">
                     {result ? `${result.model ?? '模型'}：${result.ok ? '可用' : '失败'} ${result.status ?? ''} ${result.error ?? ''}` : (p.state.last_error ?? '-')}
                   </td>
@@ -406,8 +406,8 @@ function ProviderModelTester({
     <div className="modal-backdrop">
       <div className="modal model-modal">
         <h3>检测模型：{provider.config.name}</h3>
-        <p>从该供应商已发现的模型中选择一个模型执行 `/responses` ping 检测。GPT 模型已优先排序。</p>
-        {!models.length && <p className="empty-state error">该供应商暂无已发现模型，请先点击供应商页“一键查询模型”。</p>}
+        <p>从该供应商已发现的 GPT-5.4 / GPT-5.5 中选择一个模型执行 `/responses` ping 检测。</p>
+        {!models.length && <p className="empty-state error">该供应商暂无已发现的 GPT-5.4 / GPT-5.5，请先点击供应商页“一键查询模型”。</p>}
         <label>搜索模型<input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="输入模型名称筛选" /></label>
         <div className="model-list">
           {filtered.map((model) => (
@@ -417,7 +417,7 @@ function ProviderModelTester({
               onClick={() => setSelected(model.id)}
             >
               <code>{model.id}</code>
-              {isGptModel(model.id) ? <span className="pill ok">GPT</span> : <span className="pill muted">其他</span>}
+              <span className="pill ok">支持</span>
             </button>
           ))}
           {models.length > 0 && filtered.length === 0 && <p className="muted-text">没有匹配的模型。</p>}
@@ -443,19 +443,19 @@ function Models({ cache, busy, runBusy }: { cache: ModelsCache; busy: boolean; r
       </div>
       <div className="card table-card">
         <table>
-          <thead><tr><th>模型</th><th>类型</th><th>发现供应商</th></tr></thead>
+      <thead><tr><th>模型</th><th>类型</th><th>发现供应商</th></tr></thead>
           <tbody>
             {pageItems.map((m) => {
               const foundIn = Object.values(cache.providers).filter((p) => p.models.some((pm) => pm.id === m.id)).map((p) => p.provider_id);
               return (
                 <tr key={m.id}>
                   <td><code>{m.id}</code></td>
-                  <td>{isGptModel(m.id) ? <span className="pill ok">GPT</span> : <span className="pill muted">其他</span>}</td>
+                  <td><span className="pill ok">GPT-5.4/5.5</span></td>
                   <td>{providerNames(foundIn) || '-'}</td>
                 </tr>
               );
             })}
-            {!models.length && <tr><td colSpan={3}>暂无模型，请到供应商页点击“一键查询模型”。</td></tr>}
+            {!models.length && <tr><td colSpan={3}>暂无 GPT-5.4 / GPT-5.5，请到供应商页点击“一键查询模型”。</td></tr>}
           </tbody>
         </table>
         <Pagination page={page} total={models.length} onPageChange={setPage} />
@@ -533,7 +533,7 @@ function Codex({ models, status, busy, runBusy, notify }: { models: string[]; st
         <p>将 Codex 配置到本地网关：<code>{status?.bind_url ?? 'http://127.0.0.1:14555/v1'}</code></p>
         <p>配置文件路径：<code>{configPath || '~/.codex/config.toml'}</code></p>
         <p className="inline-help">写入时会同时配置 <code>NO_PROXY=localhost,127.0.0.1,::1</code>，避免系统代理把本地网关请求拦截成 502。</p>
-        {!models.length && <p className="empty-state error">暂无已发现的 GPT 模型，请先到供应商页点击“一键查询模型”。</p>}
+        {!models.length && <p className="empty-state error">暂无已发现的 GPT-5.4 / GPT-5.5，请先到供应商页点击“一键查询模型”。</p>}
         <label>默认模型
           <select value={model} disabled={!models.length} onChange={(e) => setModel(e.target.value)}>
             {models.map((m) => <option key={m} value={m}>{m}</option>)}

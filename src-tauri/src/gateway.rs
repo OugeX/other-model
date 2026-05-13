@@ -240,6 +240,9 @@ impl GatewayManager {
             .into_iter()
             .filter_map(|raw| {
                 let id = raw.get("id")?.as_str()?.to_string();
+                if !is_supported_codex_model(&id) {
+                    return None;
+                }
                 Some(ModelInfo {
                     id,
                     object: raw
@@ -1129,7 +1132,7 @@ async fn list_models_handler(State(state): State<GatewayAppState>, headers: Head
     let mut data = Vec::new();
     for provider in cache.providers.values() {
         for model in &provider.models {
-            if seen.insert(model.id.clone()) {
+            if is_supported_codex_model(&model.id) && seen.insert(model.id.clone()) {
                 data.push(model.clone());
             }
         }
@@ -1155,7 +1158,7 @@ async fn get_model_handler(
     let cache = state.manager.storage().models_cache().await;
     for provider in cache.providers.values() {
         for item in &provider.models {
-            if item.id == model {
+            if item.id == model && is_supported_codex_model(&item.id) {
                 return Json(item).into_response();
             }
         }
@@ -1197,8 +1200,17 @@ async fn proxy_handler(State(state): State<GatewayAppState>, request: Request<Bo
 }
 
 pub fn is_gpt_model(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    lower.starts_with("gpt") || lower.contains("/gpt") || lower.contains("gpt-")
+    is_supported_codex_model(model)
+}
+
+pub fn is_supported_codex_model(model: &str) -> bool {
+    let normalized = model
+        .trim()
+        .to_ascii_lowercase()
+        .trim_start_matches("openai/")
+        .trim_start_matches("models/")
+        .to_string();
+    normalized == "gpt-5.4" || normalized == "gpt-5.5"
 }
 
 pub fn join_url(base: &str, path: &str) -> String {
@@ -1475,9 +1487,11 @@ mod tests {
     }
 
     #[test]
-    fn detects_gpt_models() {
+    fn detects_supported_codex_models() {
         assert!(is_gpt_model("gpt-5.5"));
         assert!(is_gpt_model("openai/gpt-5.4"));
+        assert!(!is_gpt_model("gpt-4o"));
+        assert!(!is_gpt_model("gpt-5.4-mini"));
         assert!(!is_gpt_model("claude-sonnet"));
     }
 

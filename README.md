@@ -23,7 +23,7 @@ Other Model is a local OpenAI-compatible desktop gateway for Codex and GPT-serie
 - SSE streaming support: failover before first output; no replay after output begins.
 - Large Codex request support: local body limit defaults to 512 MB instead of Axum's small default, with structured 413 logs when exceeded.
 - Long-running Codex stream support with configurable idle timeout.
-- Model discovery, GPT model filtering, and provider-level model tests.
+- Model discovery is intentionally limited to `gpt-5.4` and `gpt-5.5`, with provider-level tests for those models only.
 - Optional quota endpoint adapter plus request logs.
 - One-click Codex config update with automatic backup.
 - One-click gateway self-check for health, models, Responses, large bodies, streaming, and failover readiness.

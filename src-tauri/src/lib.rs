@@ -1,13 +1,18 @@
 mod codex_config;
+#[cfg(feature = "desktop")]
 mod commands;
 mod gateway;
 mod models;
 mod quota;
+mod shared;
 mod storage;
+pub mod web;
 
+#[cfg(feature = "desktop")]
 use commands::AppState;
 use gateway::GatewayManager;
 use storage::Storage;
+#[cfg(feature = "desktop")]
 use tauri::Manager;
 
 pub async fn run_gateway_only() -> anyhow::Result<()> {
@@ -44,6 +49,7 @@ pub async fn configure_codex_from_local_config(model: String) -> anyhow::Result<
     Ok(())
 }
 
+#[cfg(feature = "desktop")]
 pub fn run() {
     tauri::async_runtime::block_on(async move {
         let storage = Storage::load().await.expect("load storage");
@@ -65,4 +71,9 @@ pub fn run() {
             .run(tauri::generate_context!())
             .expect("error while running tauri application");
     });
+}
+
+#[cfg(not(feature = "desktop"))]
+pub fn run() {
+    panic!("desktop feature is disabled for this build");
 }

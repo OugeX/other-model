@@ -18,6 +18,11 @@ src-tauri/target/
 .DS_Store
 
 # generated local exports / caches
+.playwright-cli/
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 providers-export-*.json
 other-model-providers-*.json
 models_cache.json

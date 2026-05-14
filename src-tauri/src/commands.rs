@@ -8,11 +8,14 @@ use crate::{
         RequestLogEntry, TestResult,
     },
     quota,
+    shared::{
+        err_string, filter_supported_models_cache, finish_self_check, first_cached_gpt_model,
+        parse_provider_import, validate_provider,
+    },
     storage::Storage,
 };
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},
     time::Instant,
@@ -23,10 +26,6 @@ use tauri::State;
 pub struct AppState {
     pub storage: Storage,
     pub gateway: GatewayManager,
-}
-
-fn err_string(err: anyhow::Error) -> String {
-    err.to_string()
 }
 
 #[tauri::command]
@@ -52,8 +51,9 @@ pub async fn get_app_config(state: State<'_, AppState>) -> Result<AppConfig, Str
 #[tauri::command]
 pub async fn save_app_config(
     state: State<'_, AppState>,
-    config: AppConfig,
+    mut config: AppConfig,
 ) -> Result<AppConfig, String> {
+    config.normalize_balance_auth();
     state
         .storage
         .set_config(config.clone())
@@ -110,6 +110,7 @@ pub async fn create_provider(
     if provider.id.trim().is_empty() {
         provider.id = uuid::Uuid::new_v4().to_string();
     }
+    provider.normalize_balance_auth();
     validate_provider(&provider).map_err(|e| e.to_string())?;
     state
         .storage
@@ -122,8 +123,9 @@ pub async fn create_provider(
 #[tauri::command]
 pub async fn update_provider(
     state: State<'_, AppState>,
-    provider: ProviderConfig,
+    mut provider: ProviderConfig,
 ) -> Result<ProviderConfig, String> {
+    provider.normalize_balance_auth();
     validate_provider(&provider).map_err(|e| e.to_string())?;
     let found = state
         .storage
@@ -169,7 +171,7 @@ pub async fn export_providers(
         .map_err(err_string)
 }
 
-async fn export_providers_to_dir(
+pub(crate) async fn export_providers_to_dir(
     storage: Storage,
     directory: Option<String>,
 ) -> Result<ProviderExportResult> {
@@ -588,78 +590,6 @@ pub async fn reset_default_templates(state: State<'_, AppState>) -> Result<AppCo
         .await
         .map_err(err_string)?;
     Ok(cfg)
-}
-
-fn validate_provider(provider: &ProviderConfig) -> Result<()> {
-    if provider.name.trim().is_empty() {
-        return Err(anyhow!("provider name is required"));
-    }
-    if provider.base_url.trim().is_empty() {
-        return Err(anyhow!("base URL is required"));
-    }
-    if !provider.base_url.starts_with("http://") && !provider.base_url.starts_with("https://") {
-        return Err(anyhow!("base URL must start with http:// or https://"));
-    }
-    Ok(())
-}
-
-fn parse_provider_import(raw: &str) -> Result<Vec<ProviderConfig>> {
-    if raw.trim().is_empty() {
-        return Err(anyhow!("import file is empty"));
-    }
-    if let Ok(providers) = serde_json::from_str::<Vec<ProviderConfig>>(raw) {
-        return Ok(providers);
-    }
-    let value: Value = serde_json::from_str(raw)?;
-    if let Some(providers) = value.get("providers") {
-        return Ok(serde_json::from_value::<Vec<ProviderConfig>>(
-            providers.clone(),
-        )?);
-    }
-    if let Some(config) = value.get("config").and_then(|item| item.get("providers")) {
-        return Ok(serde_json::from_value::<Vec<ProviderConfig>>(
-            config.clone(),
-        )?);
-    }
-    Err(anyhow!(
-        "unsupported provider import format; expected an array or an object with providers"
-    ))
-}
-
-fn first_cached_gpt_model(cache: &ModelsCache) -> Option<String> {
-    let mut models = BTreeMap::<String, ()>::new();
-    for provider in cache.providers.values() {
-        for model in &provider.models {
-            if is_gpt_model(&model.id) {
-                models.insert(model.id.clone(), ());
-            }
-        }
-    }
-    models.into_keys().next()
-}
-
-fn filter_supported_models_cache(mut cache: ModelsCache) -> ModelsCache {
-    for provider in cache.providers.values_mut() {
-        provider.models.retain(|model| is_gpt_model(&model.id));
-    }
-    cache
-}
-
-fn finish_self_check(checks: Vec<GatewaySelfCheckItem>) -> GatewaySelfCheckResult {
-    let failed = checks.iter().filter(|item| !item.ok).count();
-    GatewaySelfCheckResult {
-        ok: failed == 0,
-        message: if failed == 0 {
-            format!("自检完成：{} 项全部通过。", checks.len())
-        } else {
-            format!(
-                "自检完成：{} 项通过，{} 项失败。",
-                checks.len() - failed,
-                failed
-            )
-        },
-        checks,
-    }
 }
 
 #[cfg(test)]

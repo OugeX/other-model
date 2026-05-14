@@ -10,6 +10,11 @@ export const newProvider = (): ProviderConfig => ({
   headers: {},
   query: {},
   quota: null,
+  balance_auth: {
+    mode: 'disabled',
+    username: null,
+    password: null,
+  },
 });
 
 export function mask(value: string, visible = 6) {

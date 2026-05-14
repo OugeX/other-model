@@ -26,6 +26,16 @@ impl Default for AppConfig {
     }
 }
 
+impl AppConfig {
+    pub fn normalize_balance_auth(&mut self) -> bool {
+        let mut changed = false;
+        for provider in &mut self.providers {
+            changed |= provider.normalize_balance_auth();
+        }
+        changed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GatewayConfig {
@@ -90,6 +100,7 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     pub query: BTreeMap<String, String>,
     pub quota: Option<QuotaConfig>,
+    pub balance_auth: Option<BalanceAuthConfig>,
 }
 
 impl ProviderConfig {
@@ -104,7 +115,26 @@ impl ProviderConfig {
             headers: BTreeMap::new(),
             query: BTreeMap::new(),
             quota: None,
+            balance_auth: Some(BalanceAuthConfig::default()),
         }
+    }
+
+    pub fn effective_balance_auth(&self) -> BalanceAuthConfig {
+        self.balance_auth.clone().unwrap_or_else(|| {
+            if self.quota.is_some() {
+                BalanceAuthConfig::quota_api()
+            } else {
+                BalanceAuthConfig::default()
+            }
+        })
+    }
+
+    pub fn normalize_balance_auth(&mut self) -> bool {
+        if self.balance_auth.is_none() {
+            self.balance_auth = Some(self.effective_balance_auth());
+            return true;
+        }
+        false
     }
 }
 
@@ -115,6 +145,48 @@ impl Default for ProviderConfig {
             "New Provider",
             "https://api.openai.com/v1",
         )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BalanceAuthMode {
+    Disabled,
+    QuotaApi,
+    NewapiLogin,
+    Sub2apiLogin,
+}
+
+impl Default for BalanceAuthMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BalanceAuthConfig {
+    pub mode: BalanceAuthMode,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl BalanceAuthConfig {
+    pub fn quota_api() -> Self {
+        Self {
+            mode: BalanceAuthMode::QuotaApi,
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for BalanceAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: BalanceAuthMode::Disabled,
+            username: None,
+            password: None,
+        }
     }
 }
 

@@ -98,22 +98,7 @@ impl GatewayManager {
         let bind_url = format!("http://{}:{}/v1", local_addr.ip(), local_addr.port());
         *self.inner.bind_url.write().await = bind_url;
 
-        let app = Router::new()
-            .route("/health", get(health_handler))
-            .route("/v1/models", get(list_models_handler))
-            .route("/v1/models/:model", get(get_model_handler))
-            .route("/v1/responses", post(responses_handler))
-            .route("/v1/chat/completions", post(chat_completions_handler))
-            .route("/v1/*path", any(proxy_handler))
-            .layer(
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods(Any)
-                    .allow_headers(Any),
-            )
-            .with_state(GatewayAppState {
-                manager: self.clone(),
-            });
+        let app = self.router();
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         *self.inner.shutdown_tx.lock().await = Some(tx);
@@ -132,6 +117,30 @@ impl GatewayManager {
         });
 
         Ok(self.status().await)
+    }
+
+    pub fn router(&self) -> Router {
+        Router::new()
+            .route("/health", get(health_handler))
+            .route("/v1/models", get(list_models_handler))
+            .route("/v1/models/:model", get(get_model_handler))
+            .route("/v1/responses", post(responses_handler))
+            .route("/v1/chat/completions", post(chat_completions_handler))
+            .route("/v1/*path", any(proxy_handler))
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+            )
+            .with_state(GatewayAppState {
+                manager: self.clone(),
+            })
+    }
+
+    pub async fn mark_running_at(&self, bind_url: String) {
+        *self.inner.bind_url.write().await = bind_url;
+        self.inner.running.store(true, Ordering::SeqCst);
     }
 
     pub async fn stop(&self) -> Result<GatewayStatus> {

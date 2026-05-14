@@ -2,12 +2,16 @@
 
 ![Other Model logo](docs/logo.png)
 
-Other Model is a local OpenAI-compatible desktop gateway for Codex and GPT-series upstream providers. It lets Codex call `http://127.0.0.1:14555/v1` first, then routes requests to a managed pool of upstream providers with round-robin, failover, model discovery, health checks, quota hints, logs, and one-click Codex configuration.
+> Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
+
+Other Model is a local OpenAI-compatible gateway for Codex and GPT-series upstream providers. It ships as a Tauri desktop app and as a single-machine self-hosted Web service. Codex calls the local `/v1` gateway first, then Other Model routes requests to a managed pool of upstream providers with round-robin, failover, model discovery, health checks, quota hints, logs, and Codex configuration helpers.
 
 ## Features
 
 - Cross-platform Tauri v2 desktop app with React + TypeScript UI.
-- Local OpenAI-compatible gateway at `http://127.0.0.1:14555/v1`.
+- Self-hosted Web version: one Rust service serves the admin UI, REST API, and `/v1` gateway.
+- Desktop local gateway: `http://127.0.0.1:14555/v1`.
+- Web local gateway: `http://127.0.0.1:14556/v1`.
 - Provider management: add, edit, delete, enable/disable, import, export, and health state.
 - Export providers to a user-selected directory as JSON.
 - OpenAI-compatible proxy endpoints:
@@ -25,7 +29,8 @@ Other Model is a local OpenAI-compatible desktop gateway for Codex and GPT-serie
 - Long-running Codex stream support with configurable idle timeout.
 - Model discovery is intentionally limited to `gpt-5.4` and `gpt-5.5`, with provider-level tests for those models only.
 - Optional quota endpoint adapter plus request logs.
-- One-click Codex config update with automatic backup.
+- Desktop: one-click Codex config update with automatic backup.
+- Web: copyable `config.toml` snippet and downloadable `configure-codex.sh`; it never writes local Codex files from the browser.
 - One-click gateway self-check for health, models, Responses, large bodies, streaming, and failover readiness.
 - Lightweight local plaintext storage.
 
@@ -61,6 +66,26 @@ npm run tauri -- build
 ./src-tauri/target/release/other-model --gateway-only
 ```
 
+Run the self-hosted Web version:
+
+```bash
+npm run build
+cd src-tauri
+cargo run --bin other-model-web -- serve --host 127.0.0.1 --port 14556
+```
+
+Or from the repository root:
+
+```bash
+npm run web:serve
+```
+
+Web environment variables:
+
+- `OTHER_MODEL_DB=/path/to/other-model.sqlite` overrides the default SQLite path.
+- `OTHER_MODEL_ADMIN_PASSWORD=...` sets or resets the single admin password.
+- `OTHER_MODEL_WEB_DIST=/path/to/dist` overrides the React static asset directory.
+
 ## Local storage
 
 Runtime config is stored in the OS data directory under `Other Model`:
@@ -72,6 +97,14 @@ Runtime config is stored in the OS data directory under `Other Model`:
 
 API keys are stored in plaintext for this MVP. Provider import/export JSON files also contain plaintext API keys, so keep them private.
 
+The Web version uses a single SQLite database:
+
+- default path: `./data/other-model.sqlite`
+- override path: `OTHER_MODEL_DB=/path/to/other-model.sqlite`
+- tables include `app_config`, `providers`, `provider_state`, `models_cache`, `request_logs`, and `response_routes`.
+
+The first Web launch generates an admin password and prints it once in the terminal. If you lose it, restart with `OTHER_MODEL_ADMIN_PASSWORD=your-new-password`.
+
 Gateway defaults:
 
 - local base URL: `http://127.0.0.1:14555/v1`
@@ -82,6 +115,8 @@ Gateway defaults:
 If a request exceeds the configured local body limit, Other Model returns a structured `413 Payload Too Large` JSON response and writes a request log row with `local_rejected=true`.
 
 ## Codex configuration
+
+### Desktop app
 
 The app writes `~/.codex/config.toml` with an `other_model_gateway` provider when no active provider exists, or replaces the currently active provider in-place when one is already configured:
 
@@ -107,6 +142,24 @@ If Codex CLI still reports `unexpected status 502 Bad Gateway` and the Other Mod
 
 ```bash
 NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 codex exec "只回复 pong"
+```
+
+### Web version
+
+The Web version does not modify `~/.codex/config.toml`. Open the Codex page, choose `gpt-5.4` or `gpt-5.5`, then copy the generated snippet or download `configure-codex.sh`.
+
+Example snippet:
+
+```toml
+model = "gpt-5.5"
+model_provider = "other_model_web"
+
+[model_providers.other_model_web]
+name = "Other Model Web"
+base_url = "http://127.0.0.1:14556/v1"
+wire_api = "responses"
+supports_websockets = false
+experimental_bearer_token = "..."
 ```
 
 ## macOS unsigned builds

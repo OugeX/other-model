@@ -4,6 +4,8 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { api } from './api';
 import type {
   AppConfig,
+  BalanceAuthMode,
+  CodexSnippet,
   CodexConfigResult,
   GatewayStatus,
   ModelsCache,
@@ -18,6 +20,7 @@ import { flattenModels, gptModelsFromCache, healthClass, healthLabel, isGptModel
 import './styles.css';
 
 const PAGE_SIZE = 10;
+const IS_TAURI = api.isTauriMode();
 
 type PopupTone = 'info' | 'success' | 'error' | 'warning';
 type TotalPopupState = {
@@ -37,9 +40,37 @@ const tabs: { key: Tab; label: string; hint: string }[] = [
   { key: 'models', label: '模型', hint: '仅 GPT-5.4/5.5' },
   { key: 'quota', label: '额度', hint: '余额/健康' },
   { key: 'logs', label: '日志', hint: '请求流水' },
-  { key: 'codex', label: 'Codex', hint: '一键配置' },
+  { key: 'codex', label: 'Codex', hint: IS_TAURI ? '一键配置' : '复制配置' },
   { key: 'settings', label: '设置', hint: '网关参数' },
 ];
+
+const DEFAULT_BALANCE_AUTH = {
+  mode: 'disabled' as BalanceAuthMode,
+  username: null as string | null,
+  password: null as string | null,
+};
+
+const balanceQueryMode = (provider: ProviderConfig): BalanceAuthMode =>
+  provider.balance_auth?.mode ?? (provider.quota ? 'quota_api' : 'disabled');
+
+const isLoginBalanceMode = (mode: BalanceAuthMode) => mode === 'newapi_login' || mode === 'sub2api_login';
+
+const cloneProvider = (provider: ProviderConfig): ProviderConfig => ({
+  ...provider,
+  headers: { ...provider.headers },
+  query: { ...provider.query },
+  quota: provider.quota
+    ? {
+        ...provider.quota,
+        headers: { ...provider.quota.headers },
+      }
+    : null,
+  balance_auth: {
+    ...DEFAULT_BALANCE_AUTH,
+    ...(provider.balance_auth ?? {}),
+    mode: balanceQueryMode(provider),
+  },
+});
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('dashboard');
@@ -50,6 +81,7 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [popup, setPopup] = useState<TotalPopupState | null>(null);
   const [busy, setBusy] = useState(false);
+  const [authenticated, setAuthenticated] = useState(api.hasAdminToken());
 
   const notify: Notify = (next) => setPopup({ tone: 'info', ...next });
 
@@ -67,10 +99,16 @@ export default function App() {
   };
 
   useEffect(() => {
-    refresh().catch((err) => notify({ title: '刷新失败', message: formatError(err), tone: 'error', manual: true }));
-    const timer = window.setInterval(() => refresh().catch(() => undefined), 5000);
+    if (!authenticated) return;
+    refresh().catch((err) => {
+      if (!IS_TAURI && (err as Error & { status?: number }).status === 401) setAuthenticated(false);
+      else notify({ title: '刷新失败', message: formatError(err), tone: 'error', manual: true });
+    });
+    const timer = window.setInterval(() => refresh().catch((err) => {
+      if (!IS_TAURI && (err as Error & { status?: number }).status === 401) setAuthenticated(false);
+    }), 5000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [authenticated]);
 
   const gptModels = useMemo(() => gptModelsFromCache(modelsCache), [modelsCache]);
 
@@ -86,6 +124,43 @@ export default function App() {
       setBusy(false);
     }
   };
+
+  const logout = async () => {
+    setBusy(true);
+    try {
+      await api.logout();
+      setAuthenticated(false);
+      notify({ title: '已退出登录', message: '已退出 Other Model Web 管理后台。', tone: 'success' });
+    } catch (err) {
+      setAuthenticated(false);
+      notify({ title: '已退出登录', message: `本地会话已清除。${formatError(err)}`, tone: 'warning', manual: true });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!IS_TAURI && !authenticated) {
+    return (
+      <>
+        <LoginScreen
+          busy={busy}
+          onLogin={async (password) => {
+            setBusy(true);
+            try {
+              await api.login(password);
+              setAuthenticated(true);
+              notify({ title: '登录成功', message: '已进入 Other Model Web 管理后台。', tone: 'success' });
+            } catch (err) {
+              notify({ title: '登录失败', message: formatError(err), tone: 'error', manual: true });
+            } finally {
+              setBusy(false);
+            }
+          }}
+        />
+        {popup && <TotalPopup popup={popup} onClose={() => setPopup(null)} />}
+      </>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -120,15 +195,22 @@ export default function App() {
             <p>{tabs.find((t) => t.key === tab)?.hint}</p>
           </div>
           <div className="top-actions">
-            <button disabled={busy} onClick={() => runBusy(() => api.start().then(setStatus), '网关已启动')}>启动</button>
-            <button disabled={busy} onClick={() => runBusy(() => api.stop().then(setStatus), '网关已停止')}>停止</button>
+            {IS_TAURI ? (
+              <>
+                <button disabled={busy} onClick={() => runBusy(() => api.start().then(setStatus), '网关已启动')}>启动</button>
+                <button disabled={busy} onClick={() => runBusy(() => api.stop().then(setStatus), '网关已停止')}>停止</button>
+              </>
+            ) : (
+              <span className="pill ok">Web 服务运行中</span>
+            )}
             <button disabled={busy} onClick={() => runBusy(refresh, '已刷新')}>刷新</button>
+            {!IS_TAURI && <button disabled={busy} onClick={logout}>退出</button>}
           </div>
         </header>
         {tab === 'dashboard' && <Dashboard status={status} providers={providers} models={gptModels.length} logs={logs} />}
         {tab === 'providers' && <Providers providers={providers} cache={modelsCache} busy={busy} runBusy={runBusy} notify={notify} />}
         {tab === 'models' && <Models cache={modelsCache} busy={busy} runBusy={runBusy} />}
-        {tab === 'quota' && <Quota providers={providers} busy={busy} runBusy={runBusy} />}
+        {tab === 'quota' && <Quota providers={providers} busy={busy} runBusy={runBusy} notify={notify} />}
         {tab === 'logs' && <Logs logs={logs} />}
         {tab === 'codex' && <Codex models={gptModels.map((m) => m.id)} status={status} busy={busy} runBusy={runBusy} notify={notify} />}
         {tab === 'settings' && <Settings config={config} setConfig={setConfig} providers={providers} defaultModel={gptModels[0]?.id} busy={busy} runBusy={runBusy} notify={notify} />}
@@ -158,6 +240,35 @@ function TotalPopup({ popup, onClose }: { popup: TotalPopupState; onClose: () =>
       </div>
     </div>,
     document.body,
+  );
+}
+
+function LoginScreen({ busy, onLogin }: { busy: boolean; onLogin: (password: string) => Promise<void> }) {
+  const [password, setPassword] = useState('');
+  return (
+    <div className="login-shell">
+      <div className="login-card">
+        <div className="brand login-brand">
+          <div className="brand-icon"><img src="/logo.svg" alt="Other Model" /></div>
+          <div>
+            <h1>Other Model Web</h1>
+            <p>单机自托管模型网关</p>
+          </div>
+        </div>
+        <p>请输入管理员密码。首次启动时密码会打印在 <code>other-model-web</code> 终端输出中；也可以通过 <code>OTHER_MODEL_ADMIN_PASSWORD</code> 重置。</p>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            onLogin(password);
+          }}
+        >
+          <label>管理员密码
+            <input autoFocus type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="输入管理员密码" />
+          </label>
+          <button disabled={busy || !password.trim()} type="submit">登录</button>
+        </form>
+      </div>
+    </div>
   );
 }
 
@@ -250,10 +361,14 @@ function Providers({ providers, cache, busy, runBusy, notify }: { providers: Pro
   };
 
   const exportProviders = async () => {
-    const selected = await open({ directory: true, multiple: false, title: '选择供应商导出目录' });
-    if (!selected || Array.isArray(selected)) {
-      notify({ title: '已取消导出', message: '未选择导出目录。', tone: 'info' });
-      return;
+    let selected: string | undefined;
+    if (IS_TAURI) {
+      const result = await open({ directory: true, multiple: false, title: '选择供应商导出目录' });
+      if (!result || Array.isArray(result)) {
+        notify({ title: '已取消导出', message: '未选择导出目录。', tone: 'info' });
+        return;
+      }
+      selected = result;
     }
     await runBusy(async () => {
       const result = await api.exportProviders(selected);
@@ -337,8 +452,21 @@ function Providers({ providers, cache, busy, runBusy, notify }: { providers: Pro
 }
 
 function ProviderEditor({ provider, onClose, runBusy }: { provider: ProviderConfig; onClose: () => void; runBusy: BusyRunner }) {
-  const [draft, setDraft] = useState<ProviderConfig>({ ...provider });
+  const [draft, setDraft] = useState<ProviderConfig>(() => cloneProvider(provider));
   const isNew = !provider.id || provider.name === 'New Provider';
+  const balanceMode = balanceQueryMode(draft);
+  const balanceAuth = { ...DEFAULT_BALANCE_AUTH, ...(draft.balance_auth ?? {}), mode: balanceMode };
+
+  const setBalanceMode = (mode: BalanceAuthMode) => {
+    setDraft({
+      ...draft,
+      balance_auth: {
+        ...balanceAuth,
+        mode,
+      },
+    });
+  };
+
   const save = async () => {
     await runBusy(async () => {
       if (isNew) await api.createProvider(draft);
@@ -357,11 +485,56 @@ function ProviderEditor({ provider, onClose, runBusy }: { provider: ProviderConf
           <label><input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} /> 启用</label>
           <label>超时秒<input type="number" value={draft.timeout_secs} onChange={(e) => setDraft({ ...draft, timeout_secs: Number(e.target.value) || 300 })} /></label>
         </div>
-        <details>
-          <summary>额度接口（可选）</summary>
-          <label>Quota URL<input value={draft.quota?.url ?? ''} onChange={(e) => setDraft({ ...draft, quota: { ...(draft.quota ?? { method: 'GET', headers: {} }), url: e.target.value } })} /></label>
-          <label>余额 JSON 路径<input placeholder="$.data.balance" value={draft.quota?.balance_json_path ?? ''} onChange={(e) => setDraft({ ...draft, quota: { ...(draft.quota ?? { method: 'GET', headers: {}, url: '' }), balance_json_path: e.target.value } })} /></label>
-        </details>
+        <div className="card">
+          <h4>余额查询方式</h4>
+          <label>查询模式
+            <select value={balanceMode} onChange={(e) => setBalanceMode(e.target.value as BalanceAuthMode)}>
+              <option value="disabled">关闭</option>
+              <option value="quota_api">余额接口</option>
+              <option value="newapi_login">newapi 登录查余额</option>
+              <option value="sub2api_login">sub2api 登录查余额</option>
+            </select>
+          </label>
+          <p className="inline-help">仅支持账号密码直登；不支持 2FA / 验证码。凭据会按当前本地存储策略保存。</p>
+          {balanceMode === 'sub2api_login' && (
+            <p className="inline-help">sub2api 官方登录接口通常要求填写完整登录邮箱，不能只填站内昵称或数字账号。</p>
+          )}
+          {balanceMode === 'quota_api' && (
+            <>
+              <label>Quota URL<input value={draft.quota?.url ?? ''} onChange={(e) => setDraft({ ...draft, quota: { ...(draft.quota ?? { method: 'GET', headers: {} }), url: e.target.value } })} /></label>
+              <label>余额 JSON 路径<input placeholder="$.data.balance" value={draft.quota?.balance_json_path ?? ''} onChange={(e) => setDraft({ ...draft, quota: { ...(draft.quota ?? { method: 'GET', headers: {}, url: '' }), balance_json_path: e.target.value } })} /></label>
+            </>
+          )}
+          {isLoginBalanceMode(balanceMode) && (
+            <>
+              <label>{balanceMode === 'newapi_login' ? '用户名' : '邮箱/账号'}
+                <input
+                  value={balanceAuth.username ?? ''}
+                  onChange={(e) => setDraft({
+                    ...draft,
+                    balance_auth: {
+                      ...balanceAuth,
+                      username: e.target.value,
+                    },
+                  })}
+                />
+              </label>
+              <label>登录密码
+                <input
+                  type="password"
+                  value={balanceAuth.password ?? ''}
+                  onChange={(e) => setDraft({
+                    ...draft,
+                    balance_auth: {
+                      ...balanceAuth,
+                      password: e.target.value,
+                    },
+                  })}
+                />
+              </label>
+            </>
+          )}
+        </div>
         <div className="modal-actions"><button onClick={save}>保存</button><button onClick={onClose}>取消</button></div>
       </div>
     </div>
@@ -466,22 +639,100 @@ function Models({ cache, busy, runBusy }: { cache: ModelsCache; busy: boolean; r
   );
 }
 
-function Quota({ providers, busy, runBusy }: { providers: ProviderView[]; busy: boolean; runBusy: BusyRunner }) {
+function Quota({ providers, busy, runBusy, notify }: { providers: ProviderView[]; busy: boolean; runBusy: BusyRunner; notify: Notify }) {
   const [results, setResults] = useState<Record<string, QuotaResult>>({});
+  const [queryingAll, setQueryingAll] = useState(false);
+
+  const storeResult = (providerId: string, result: QuotaResult) => {
+    setResults((current) => ({ ...current, [providerId]: result }));
+  };
+
+  const queryProviderBalance = async (provider: ProviderView) => {
+    const result = await api.getQuota(provider.config.id);
+    storeResult(provider.config.id, result);
+    return result;
+  };
+
+  const queryAllBalances = async () => {
+    if (!providers.length) {
+      notify({ title: '暂无可查询供应商', message: '请先在供应商页面添加供应商。', tone: 'warning', manual: true });
+      return;
+    }
+
+    setQueryingAll(true);
+    await runBusy(async () => {
+      const settled = await Promise.all(
+        providers.map(async (provider) => {
+          try {
+            const result = await queryProviderBalance(provider);
+            return { provider, result };
+          } catch (err) {
+            const result: QuotaResult = {
+              provider_id: provider.config.id,
+              ok: false,
+              error: formatError(err),
+            };
+            storeResult(provider.config.id, result);
+            return { provider, result };
+          }
+        }),
+      );
+
+      const successCount = settled.filter((item) => item.result.ok).length;
+      const failureCount = settled.length - successCount;
+      const details = settled
+        .map(({ provider, result }) => {
+          if (result.ok) {
+            const summary = [result.balance, result.health_hint].filter(Boolean).join(' · ') || '查询完成';
+            return `✓ ${provider.config.name}: ${summary}`;
+          }
+          return `✗ ${provider.config.name}: ${result.error ?? (result.status ? `HTTP ${result.status}` : '查询失败')}`;
+        })
+        .join('\n');
+
+      notify({
+        title: failureCount ? '批量查询完成（部分失败）' : '批量查询完成',
+        message: failureCount ? `成功 ${successCount} 个，失败 ${failureCount} 个。` : `已完成 ${successCount} 个供应商余额查询。`,
+        tone: failureCount ? 'warning' : 'success',
+        manual: failureCount > 0,
+        details,
+      });
+    });
+    setQueryingAll(false);
+  };
+
   return (
-    <section className="grid">
-      {providers.map((p) => {
-        const result = results[p.config.id];
-        return (
-          <div className="card" key={p.config.id}>
-            <h3>{p.config.name}</h3>
-            <p><span className={`pill ${healthClass(p.state.health)}`}>{healthLabel(p.state.health)}</span></p>
-            <p>额度：{result?.balance ?? p.state.remaining_hint ?? result?.health_hint ?? '未查询/未配置适配器'}</p>
-            {result?.error && <p className="danger-text">{result.error}</p>}
-            <button disabled={busy} onClick={() => runBusy(async () => setResults({ ...results, [p.config.id]: await api.getQuota(p.config.id) }), '额度查询完成')}>查询额度</button>
-          </div>
-        );
-      })}
+    <section className="stack">
+      <div className="section-actions quota-toolbar">
+        <button disabled={busy || !providers.length} onClick={queryAllBalances}>
+          {queryingAll ? '正在查询全部余额...' : '一键查询全部余额'}
+        </button>
+        <p className="inline-help">会批量查询当前列表中的全部供应商，并把结果更新到下方卡片。</p>
+      </div>
+      <div className="grid">
+        {providers.map((p) => {
+          const result = results[p.config.id];
+          const mode = balanceQueryMode(p.config);
+          const modeLabel = mode === 'quota_api'
+            ? '余额接口'
+            : mode === 'newapi_login'
+              ? 'newapi 登录'
+              : mode === 'sub2api_login'
+                ? 'sub2api 登录'
+                : '关闭';
+          return (
+            <div className="card" key={p.config.id}>
+              <h3>{p.config.name}</h3>
+              <p><span className={`pill ${healthClass(p.state.health)}`}>{healthLabel(p.state.health)}</span></p>
+              <p>查询方式：{modeLabel}</p>
+              <p>余额：{result?.balance ?? p.state.remaining_hint ?? result?.health_hint ?? '未查询/未配置适配器'}</p>
+              {result?.health_hint && <p className="inline-help">{result.health_hint}</p>}
+              {result?.error && <p className="danger-text">{result.error}</p>}
+              <button disabled={busy} onClick={() => runBusy(async () => { await queryProviderBalance(p); }, '余额查询完成')}>查询余额</button>
+            </div>
+          );
+        })}
+      </div>
     </section>
   );
 }
@@ -510,14 +761,25 @@ function Logs({ logs }: { logs: RequestLogEntry[] }) {
 function Codex({ models, status, busy, runBusy, notify }: { models: string[]; status: GatewayStatus | null; busy: boolean; runBusy: BusyRunner; notify: Notify }) {
   const [model, setModel] = useState(models[0] ?? '');
   const [configPath, setConfigPath] = useState('');
-  useEffect(() => { api.codexConfigPath().then(setConfigPath).catch(() => setConfigPath('~/.codex/config.toml')); }, []);
+  const [snippet, setSnippet] = useState<CodexSnippet | null>(null);
   useEffect(() => {
+    if (IS_TAURI) api.codexConfigPath().then(setConfigPath).catch(() => setConfigPath('~/.codex/config.toml'));
+  }, []);
+  useEffect(() => {
+    if (!IS_TAURI) {
+      if (!model || !['gpt-5.4', 'gpt-5.5'].includes(model)) setModel('gpt-5.5');
+      return;
+    }
     if (!models.length) {
       setModel('');
       return;
     }
     if (!model || !models.includes(model)) setModel(models[0]);
   }, [models, model]);
+  useEffect(() => {
+    if (IS_TAURI || !model) return;
+    api.codexSnippet(model).then(setSnippet).catch(() => setSnippet(null));
+  }, [model]);
   const canConfigure = models.length > 0 && Boolean(model);
   const showCodexResult = (result: CodexConfigResult) => {
     notify({
@@ -528,6 +790,48 @@ function Codex({ models, status, busy, runBusy, notify }: { models: string[]; st
       details: `配置文件：${result.config_path}${result.backup_path ? `\n备份文件：${result.backup_path}` : ''}\n本地代理绕过：NO_PROXY=localhost,127.0.0.1,::1\n如 Codex CLI 或终端已打开，请重启终端/Codex 后再测试。`,
     });
   };
+  if (!IS_TAURI) {
+    const effectiveSnippet = snippet;
+    const downloadScript = () => {
+      if (!effectiveSnippet) return;
+      const blob = new Blob([effectiveSnippet.configure_script], { type: 'application/x-sh;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = effectiveSnippet.download_name || 'configure-codex.sh';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    };
+    const copySnippet = async () => {
+      if (!effectiveSnippet) return;
+      await navigator.clipboard.writeText(effectiveSnippet.config_toml);
+      notify({ title: '已复制配置片段', message: '请粘贴到 ~/.codex/config.toml 中，或下载脚本后手动执行。', tone: 'success' });
+    };
+    return (
+      <section className="stack">
+        <div className="card">
+          <h3>Codex 手动配置片段</h3>
+          <p>Web 版本不会修改本机文件，只提供配置片段和脚本下载。网关地址：<code>{effectiveSnippet?.base_url ?? status?.bind_url ?? 'http://127.0.0.1:14556/v1'}</code></p>
+          <p className="inline-help">请将下面片段合并到 <code>~/.codex/config.toml</code>。如果已有 <code>model</code>、<code>model_provider</code> 或同名 provider，请替换旧值，不要重复插入。</p>
+          <label>默认模型
+            <select value={model} onChange={(e) => setModel(e.target.value)}>
+              {['gpt-5.5', 'gpt-5.4'].map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </label>
+          <label>本地网关 Bearer Token
+            <input readOnly value={effectiveSnippet?.bearer_token ?? ''} />
+          </label>
+          <pre className="snippet-box">{effectiveSnippet?.config_toml ?? '正在生成配置片段...'}</pre>
+          <div className="section-actions">
+            <button disabled={!effectiveSnippet} onClick={copySnippet}>复制 config.toml 片段</button>
+            <button disabled={!effectiveSnippet} onClick={downloadScript}>下载 configure-codex.sh</button>
+          </div>
+        </div>
+      </section>
+    );
+  }
   return (
     <section className="stack">
       <div className="card">

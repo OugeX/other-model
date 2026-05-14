@@ -24,6 +24,14 @@ export interface QuotaConfig {
   balance_json_path?: string | null;
 }
 
+export type BalanceAuthMode = 'disabled' | 'quota_api' | 'newapi_login' | 'sub2api_login';
+
+export interface BalanceAuthConfig {
+  mode: BalanceAuthMode;
+  username?: string | null;
+  password?: string | null;
+}
+
 export interface ProviderConfig {
   id: string;
   name: string;
@@ -34,6 +42,7 @@ export interface ProviderConfig {
   headers: Record<string, string>;
   query: Record<string, string>;
   quota?: QuotaConfig | null;
+  balance_auth?: BalanceAuthConfig | null;
 }
 
 export interface AppConfig {
@@ -163,6 +172,15 @@ export interface CodexConfigResult {
   config_path: string;
   backup_path?: string | null;
   message: string;
+}
+
+export interface CodexSnippet {
+  model: string;
+  base_url: string;
+  bearer_token: string;
+  config_toml: string;
+  configure_script: string;
+  download_name: string;
 }
 
 export type Tab = 'dashboard' | 'providers' | 'models' | 'quota' | 'logs' | 'codex' | 'settings';

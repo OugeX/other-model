@@ -52,7 +52,12 @@ impl Storage {
                 || !raw.contains("auto_failover")
                 || !raw.contains("selected_provider_id")
                 || !raw.contains("stream_idle_timeout_secs")
-                || !raw.contains("max_request_body_mb");
+                || !raw.contains("max_request_body_mb")
+                || !raw.contains("codex_context_body_limit_mb")
+                || !raw.contains("codex_auto_compact_token_limit")
+                || !raw.contains("auth_failure_threshold")
+                || !raw.contains("probe_interval_secs")
+                || !raw.contains("max_cooldown_secs");
             (cfg, should_save)
         } else {
             let cfg = AppConfig::default();
@@ -72,14 +77,22 @@ impl Storage {
                 .with_context(|| format!("migrate {}", config_path.display()))?;
         }
 
-        let runtime_state = if state_path.exists() {
+        let (runtime_state, should_save_runtime_state) = if state_path.exists() {
             let raw = tokio::fs::read_to_string(&state_path)
                 .await
                 .unwrap_or_default();
-            serde_json::from_str::<RuntimeState>(&raw).unwrap_or_default()
+            let mut state = serde_json::from_str::<RuntimeState>(&raw).unwrap_or_default();
+            let should_save = state.normalize_legacy_provider_states();
+            (state, should_save)
         } else {
-            RuntimeState::default()
+            (RuntimeState::default(), false)
         };
+        if should_save_runtime_state {
+            let raw = serde_json::to_string_pretty(&runtime_state)?;
+            tokio::fs::write(&state_path, raw)
+                .await
+                .with_context(|| format!("migrate {}", state_path.display()))?;
+        }
 
         let models_cache = if models_path.exists() {
             let raw = tokio::fs::read_to_string(&models_path)
@@ -124,10 +137,14 @@ impl Storage {
             if config.normalize_balance_auth() {
                 sqlite_set_app_value(&conn, "config", &config)?;
             }
-            let runtime_state =
+            let mut runtime_state =
                 sqlite_get_app_value::<RuntimeState>(&conn, "runtime_state")?.unwrap_or_default();
+            let runtime_state_changed = runtime_state.normalize_legacy_provider_states();
             let models_cache =
                 sqlite_get_app_value::<ModelsCache>(&conn, "models_cache")?.unwrap_or_default();
+            if runtime_state_changed {
+                sqlite_set_app_value(&conn, "runtime_state", &runtime_state)?;
+            }
             sqlite_sync_providers(&conn, &config)?;
             sqlite_sync_runtime_state(&conn, &runtime_state)?;
             sqlite_sync_models_cache(&conn, &models_cache)?;

@@ -40,6 +40,7 @@ pub async fn configure_codex_from_local_config(model: String) -> anyhow::Result<
         models::ConfigureCodexRequest {
             model,
             provider_name: None,
+            auto_compact_token_limit: Some(cfg.gateway.codex_auto_compact_token_limit),
         },
         gateway_base_url,
         cfg.local_auth_token,

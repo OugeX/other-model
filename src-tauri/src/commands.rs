@@ -543,9 +543,12 @@ pub async fn run_gateway_self_check(
 #[tauri::command]
 pub async fn configure_codex(
     state: State<'_, AppState>,
-    request: ConfigureCodexRequest,
+    mut request: ConfigureCodexRequest,
 ) -> Result<CodexConfigResult, String> {
     let cfg = state.storage.config().await;
+    if request.auto_compact_token_limit.is_none() {
+        request.auto_compact_token_limit = Some(cfg.gateway.codex_auto_compact_token_limit);
+    }
     let status = state.gateway.status().await;
     let url = status.bind_url;
     codex_config::configure_codex(request, url, cfg.local_auth_token)

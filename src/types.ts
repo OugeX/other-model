@@ -7,6 +7,8 @@ export interface GatewayConfig {
   request_timeout_secs: number;
   stream_idle_timeout_secs: number;
   max_request_body_mb: number;
+  codex_context_body_limit_mb: number;
+  codex_auto_compact_token_limit: number;
 }
 
 export interface RoutingConfig {
@@ -14,6 +16,9 @@ export interface RoutingConfig {
   auto_failover: boolean;
   max_attempts_per_request: number;
   cooldown_secs: number;
+  auth_failure_threshold?: number;
+  probe_interval_secs?: number;
+  max_cooldown_secs?: number;
   selected_provider_id?: string | null;
 }
 
@@ -56,8 +61,13 @@ export interface ProviderState {
   provider_id: string;
   health: ProviderHealth;
   last_checked_at?: string | null;
+  last_success_at?: string | null;
   cooldown_until?: string | null;
+  next_probe_at?: string | null;
   consecutive_failures: number;
+  auth_failure_count?: number;
+  transient_failure_count?: number;
+  error_kind?: string | null;
   last_error?: string | null;
   last_latency_ms?: number | null;
   last_status?: number | null;
@@ -129,6 +139,7 @@ export interface RequestLogEntry {
   body_size_bytes?: number | null;
   failover_reason?: string | null;
   local_rejected?: boolean;
+  error_kind?: string | null;
   error?: string | null;
   usage?: unknown;
 }
@@ -178,6 +189,7 @@ export interface CodexSnippet {
   model: string;
   base_url: string;
   bearer_token: string;
+  auto_compact_token_limit?: number | null;
   config_toml: string;
   configure_script: string;
   download_name: string;

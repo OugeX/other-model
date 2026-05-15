@@ -226,7 +226,7 @@ export const api = {
   getLogs: (limit = 200) => dispatch<RequestLogEntry[]>('get_logs', { limit }, []),
   selfCheck: (model?: string) => dispatch<GatewaySelfCheckResult>('run_gateway_self_check', { model }),
   configureCodex: (model: string, providerName = 'other_model_gateway') =>
-    call<CodexConfigResult>('configure_codex', { request: { model, provider_name: providerName } }),
+    call<CodexConfigResult>('configure_codex', { request: { model, provider_name: providerName, auto_compact_token_limit: null } }),
   restoreCodex: () => call<CodexConfigResult>('restore_codex_backup'),
   codexConfigPath: () => call<string>('get_codex_config_path', undefined, '~/.codex/config.toml'),
   appDataDir: () => dispatch<string>('app_data_dir', undefined, 'Tauri app data dir'),

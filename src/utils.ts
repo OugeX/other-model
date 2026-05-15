@@ -1,4 +1,4 @@
-import type { ProviderConfig, ProviderHealth } from './types';
+import type { ProviderConfig, ProviderHealth, ProviderState } from './types';
 
 export const newProvider = (): ProviderConfig => ({
   id: crypto.randomUUID(),
@@ -28,11 +28,31 @@ export function healthLabel(health: ProviderHealth) {
     healthy: '健康',
     degraded: '降级',
     cooling_down: '冷却中',
-    auth_failed: '认证失败',
+    auth_failed: '认证异常',
     disabled: '禁用',
     unknown: '未知',
   };
   return map[health] ?? health;
+}
+
+export function errorKindLabel(kind?: string | null) {
+  const map: Record<string, string> = {
+    auth_suspect: '认证异常（待复核）',
+    auth_failed: '认证异常',
+    permission: '分组权限限制',
+    quota: '余额/额度不足',
+    rate_limit: '上游限流',
+    upstream_5xx: '上游异常',
+    network: '网络异常',
+    unknown: '未知异常',
+  };
+  return kind ? (map[kind] ?? kind) : '';
+}
+
+export function providerStateSummary(state: ProviderState) {
+  const base = healthLabel(state.health);
+  const reason = errorKindLabel(state.error_kind);
+  return reason && reason !== base ? `${base} / ${reason}` : base;
 }
 
 export function healthClass(health: ProviderHealth) {

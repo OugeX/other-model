@@ -1,6 +1,6 @@
 use crate::models::{
     GatewayStatus, ModelInfo, ModelsCache, ProviderConfig, ProviderHealth, ProviderModels,
-    ProviderState, RequestLogEntry,
+    ProviderState, RequestLogEntry, RoutingConfig,
 };
 use crate::storage::Storage;
 use anyhow::{anyhow, Context, Result};
@@ -65,6 +65,45 @@ struct UpstreamStreamResult {
     status: StatusCode,
     headers: HeaderMap,
     latency_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorKind {
+    AuthSuspect,
+    AuthFailed,
+    Permission,
+    Quota,
+    RateLimit,
+    Upstream5xx,
+    Network,
+    Unknown,
+}
+
+impl ErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthSuspect => "auth_suspect",
+            Self::AuthFailed => "auth_failed",
+            Self::Permission => "permission",
+            Self::Quota => "quota",
+            Self::RateLimit => "rate_limit",
+            Self::Upstream5xx => "upstream_5xx",
+            Self::Network => "network",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FailureClassification {
+    health: ProviderHealth,
+    kind: ErrorKind,
+}
+
+#[derive(Debug, Clone)]
+struct EligibleProvider {
+    provider: ProviderConfig,
+    route_health: ProviderHealth,
 }
 
 impl GatewayManager {
@@ -396,25 +435,46 @@ impl GatewayManager {
             .build()?)
     }
 
-    async fn enabled_providers(&self) -> Vec<ProviderConfig> {
+    async fn eligible_providers(&self) -> Vec<EligibleProvider> {
         let cfg = self.inner.storage.config().await;
         let state = self.inner.storage.runtime_state().await;
         let now = Utc::now();
         cfg.providers
             .into_iter()
             .filter(|p| p.enabled && !p.api_key.trim().is_empty())
-            .filter(|p| {
-                if let Some(st) = state.providers.get(&p.id) {
-                    if st.health == ProviderHealth::Disabled
-                        || st.health == ProviderHealth::AuthFailed
-                    {
-                        return false;
-                    }
-                    if let Some(until) = st.cooldown_until {
-                        return until <= now;
-                    }
-                }
-                true
+            .filter_map(|p| {
+                let health = state
+                    .providers
+                    .get(&p.id)
+                    .map(|st| {
+                        if st.health == ProviderHealth::Disabled {
+                            return None;
+                        }
+                        if st.health == ProviderHealth::CoolingDown {
+                            if st.cooldown_until.is_some_and(|until| until > now) {
+                                return None;
+                            }
+                            return Some(ProviderHealth::Degraded);
+                        }
+                        if st.health == ProviderHealth::Degraded
+                            && st.error_kind.as_deref() == Some(ErrorKind::AuthSuspect.as_str())
+                            && st.cooldown_until.is_some_and(|until| until > now)
+                        {
+                            return None;
+                        }
+                        if st.health == ProviderHealth::AuthFailed {
+                            return None;
+                        }
+                        if st.health == ProviderHealth::Unknown {
+                            return Some(ProviderHealth::Healthy);
+                        }
+                        Some(st.health)
+                    })
+                    .unwrap_or(Some(ProviderHealth::Healthy))?;
+                Some(EligibleProvider {
+                    provider: p,
+                    route_health: health,
+                })
             })
             .collect()
     }
@@ -425,44 +485,133 @@ impl GatewayManager {
         auto_round_robin: bool,
         selected_provider_id: Option<String>,
     ) -> Vec<ProviderConfig> {
-        let providers = self.enabled_providers().await;
-        if providers.is_empty() {
-            return providers;
+        self.probe_due_auth_failed_providers().await;
+        let providers_with_health = self.eligible_providers().await;
+        if providers_with_health.is_empty() {
+            return Vec::new();
         }
-        if let Some(id) = forced_provider_id {
-            if let Some(provider) = providers.iter().find(|p| p.id == id) {
-                return vec![provider.clone()];
+        if let Some(id) = forced_provider_id.as_deref() {
+            if let Some(item) = providers_with_health
+                .iter()
+                .find(|item| item.provider.id == id)
+            {
+                return vec![item.provider.clone()];
             }
         }
-        if !auto_round_robin {
-            if let Some(id) = selected_provider_id
+
+        let rotation = if auto_round_robin {
+            Some(self.inner.rr_counter.fetch_add(1, Ordering::SeqCst))
+        } else {
+            None
+        };
+        let selected_id = if auto_round_robin {
+            None
+        } else {
+            selected_provider_id
                 .as_deref()
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
-            {
-                if let Some(index) = providers.iter().position(|p| p.id == id) {
-                    return providers
-                        .iter()
-                        .cycle()
-                        .skip(index)
-                        .take(providers.len())
-                        .cloned()
-                        .collect();
+        };
+        let mut providers = Vec::new();
+        for route_health in [
+            ProviderHealth::Healthy,
+            ProviderHealth::Unknown,
+            ProviderHealth::Degraded,
+        ] {
+            let mut tier = providers_with_health
+                .iter()
+                .filter(|item| item.route_health == route_health)
+                .map(|item| item.provider.clone())
+                .collect::<Vec<_>>();
+            if tier.is_empty() {
+                continue;
+            }
+            if let Some(offset) = rotation {
+                let start = offset % tier.len();
+                tier.rotate_left(start);
+            } else if let Some(id) = selected_id {
+                if let Some(index) = tier.iter().position(|p| p.id == id) {
+                    tier.rotate_left(index);
                 }
             }
+            providers.extend(tier);
         }
-        let start = if auto_round_robin {
-            self.inner.rr_counter.fetch_add(1, Ordering::SeqCst) % providers.len()
-        } else {
-            0
-        };
+
         providers
-            .iter()
-            .cycle()
-            .skip(start)
-            .take(providers.len())
-            .cloned()
-            .collect()
+    }
+
+    async fn probe_due_auth_failed_providers(&self) {
+        let cfg = self.inner.storage.config().await;
+        let runtime = self.inner.storage.runtime_state().await;
+        let now = Utc::now();
+        let providers = cfg
+            .providers
+            .into_iter()
+            .filter(|provider| provider.enabled && !provider.api_key.trim().is_empty())
+            .filter(|provider| {
+                runtime.providers.get(&provider.id).is_some_and(|state| {
+                    state.health == ProviderHealth::AuthFailed
+                        && state.next_probe_at.map(|at| at <= now).unwrap_or(true)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for provider in providers {
+            if let Err(err) = self.probe_provider_models(&provider).await {
+                eprintln!(
+                    "apidev provider probe failed provider={} error={err}",
+                    provider.name
+                );
+            }
+        }
+    }
+
+    async fn probe_provider_models(&self, provider: &ProviderConfig) -> Result<()> {
+        let url = join_url(&provider.base_url, "models");
+        let start = Instant::now();
+        let client = match self.client_for_provider(provider).await {
+            Ok(client) => client,
+            Err(err) => {
+                let _ = self
+                    .record_provider_failure(
+                        provider,
+                        None,
+                        format!("自动探活创建客户端失败: {err}"),
+                    )
+                    .await;
+                return Err(err);
+            }
+        };
+        let resp = match client.get(url).bearer_auth(&provider.api_key).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let _ = self
+                    .record_provider_failure(provider, None, format!("自动探活请求失败: {err}"))
+                    .await;
+                return Err(err.into());
+            }
+        };
+        let status = resp.status();
+        let headers = to_axum_headers(resp.headers());
+        let raw = read_limited_response_text(resp, 700).await;
+        if status.is_success() {
+            self.record_provider_success(
+                provider,
+                Some(status.as_u16()),
+                Some(start.elapsed().as_millis()),
+                rate_limit_hint(&headers),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        self.record_provider_failure(
+            provider,
+            Some(status.as_u16()),
+            format!("自动探活 /v1/models 返回 {}: {}", status.as_u16(), raw),
+        )
+        .await?;
+        Err(anyhow!("probe returned {}", status.as_u16()))
     }
 
     async fn proxy_http_request(
@@ -482,6 +631,7 @@ impl GatewayManager {
                 latency_ms: started.elapsed().as_millis(),
                 body_size_bytes: content_length(&headers),
                 local_rejected: true,
+                error_kind: Some("local_auth".to_string()),
                 error: Some("local gateway authorization failed".to_string()),
                 ..Default::default()
             };
@@ -500,7 +650,27 @@ impl GatewayManager {
             }
         }
 
-        match to_bytes(request.into_body(), limit).await {
+        let subagent_kind = codex_subagent_kind(&headers);
+        let context_guard_limit = if is_codex_context_guard_path(&path) {
+            codex_context_body_limit_bytes(cfg.gateway.codex_context_body_limit_mb, subagent_kind)
+        } else {
+            None
+        };
+        if let Some(soft_limit) = context_guard_limit {
+            if content_length(&headers).is_some_and(|size| size > soft_limit as u64) {
+                let size = content_length(&headers).unwrap_or(soft_limit as u64 + 1);
+                return self
+                    .reject_codex_context_length_before_read(
+                        method, path, headers, started, size, soft_limit,
+                    )
+                    .await;
+            }
+        }
+        let read_limit = context_guard_limit
+            .map(|soft_limit| soft_limit.saturating_add(1).min(limit))
+            .unwrap_or(limit);
+
+        match to_bytes(request.into_body(), read_limit).await {
             Ok(body) => {
                 self.proxy_request(method, path, headers, body, forced_provider_id)
                     .await
@@ -513,6 +683,16 @@ impl GatewayManager {
                     StatusCode::BAD_REQUEST
                 };
                 if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    if let Some(soft_limit) = context_guard_limit {
+                        if soft_limit < limit {
+                            let size = content_length(&headers).unwrap_or(soft_limit as u64 + 1);
+                            return self
+                                .reject_codex_context_length_before_read(
+                                    method, path, headers, started, size, soft_limit,
+                                )
+                                .await;
+                        }
+                    }
                     let size = content_length(&headers).unwrap_or(limit as u64 + 1);
                     self.reject_large_body(
                         method,
@@ -532,6 +712,7 @@ impl GatewayManager {
                         latency_ms: started.elapsed().as_millis(),
                         body_size_bytes: content_length(&headers),
                         local_rejected: true,
+                        error_kind: Some("request_body_read_failed".to_string()),
                         error: Some(format!("failed to read request body: {err_text}")),
                         ..Default::default()
                     };
@@ -566,6 +747,7 @@ impl GatewayManager {
             latency_ms: started.elapsed().as_millis(),
             body_size_bytes: Some(size),
             local_rejected: true,
+            error_kind: Some("request_body_too_large".to_string()),
             error: Some(match source_error {
                 Some(err) => format!("{message}; extractor error: {err}"),
                 None => message.clone(),
@@ -575,6 +757,42 @@ impl GatewayManager {
         log.streamed = false;
         let _ = self.inner.storage.append_log(&log).await;
         json_error(StatusCode::PAYLOAD_TOO_LARGE, &message)
+    }
+
+    async fn reject_codex_context_length_before_read(
+        &self,
+        method: Method,
+        path: String,
+        headers: HeaderMap,
+        started: Instant,
+        size: u64,
+        limit: usize,
+    ) -> Response {
+        let respond_as_stream = accepts_event_stream(&headers);
+        let message = codex_context_limit_message(size, limit);
+        let mut log = RequestLogEntry {
+            method: method.to_string(),
+            path: format!("/v1/{path}"),
+            status: Some(if respond_as_stream {
+                StatusCode::OK.as_u16()
+            } else {
+                StatusCode::BAD_REQUEST.as_u16()
+            }),
+            latency_ms: started.elapsed().as_millis(),
+            streamed: respond_as_stream,
+            body_size_bytes: Some(size),
+            local_rejected: true,
+            error_kind: Some("context_too_large".to_string()),
+            error: Some(message.clone()),
+            ..Default::default()
+        };
+        log.streamed = respond_as_stream;
+        let _ = self.inner.storage.append_log(&log).await;
+        if respond_as_stream {
+            context_length_exceeded_sse_response(&message, size, limit)
+        } else {
+            context_length_json_error(StatusCode::BAD_REQUEST, &message)
+        }
     }
 
     async fn proxy_request(
@@ -609,12 +827,30 @@ impl GatewayManager {
             log.error = Some("local gateway authorization failed".to_string());
             log.status = Some(StatusCode::UNAUTHORIZED.as_u16());
             log.local_rejected = true;
+            log.error_kind = Some("local_auth".to_string());
             log.latency_ms = started.elapsed().as_millis();
             let _ = self.inner.storage.append_log(&log).await;
             eprintln!("apidev gateway auth failed id={}", log.id);
             return resp;
         }
         let cfg = self.inner.storage.config().await;
+        let subagent_kind = codex_subagent_kind(&headers);
+        if let Some(limit) =
+            codex_context_body_limit_bytes(cfg.gateway.codex_context_body_limit_mb, subagent_kind)
+        {
+            if is_codex_context_guard_path(&path) && body.len() > limit {
+                let respond_as_stream = streamed || accepts_event_stream(&headers);
+                return self
+                    .reject_codex_context_body(
+                        log,
+                        started,
+                        body.len() as u64,
+                        limit,
+                        respond_as_stream,
+                    )
+                    .await;
+            }
+        }
         let providers = self
             .ordered_providers(
                 forced_provider_id,
@@ -738,6 +974,39 @@ impl GatewayManager {
             StatusCode::BAD_GATEWAY,
             &last_error.unwrap_or_else(|| "all upstream providers failed".to_string()),
         )
+    }
+
+    async fn reject_codex_context_body(
+        &self,
+        mut log: RequestLogEntry,
+        started: Instant,
+        size: u64,
+        limit: usize,
+        respond_as_stream: bool,
+    ) -> Response {
+        let message = codex_context_limit_message(size, limit);
+        log.status = Some(if respond_as_stream {
+            StatusCode::OK.as_u16()
+        } else {
+            StatusCode::BAD_REQUEST.as_u16()
+        });
+        log.latency_ms = started.elapsed().as_millis();
+        log.body_size_bytes = Some(size);
+        log.local_rejected = true;
+        log.streamed = respond_as_stream;
+        log.error_kind = Some("context_too_large".to_string());
+        log.error = Some(message.clone());
+        let log_id = log.id.clone();
+        let _ = self.inner.storage.append_log(&log).await;
+        eprintln!(
+            "apidev codex context guard id={} size={} limit={} streamed={}",
+            log_id, size, limit, respond_as_stream
+        );
+        if respond_as_stream {
+            context_length_exceeded_sse_response(&message, size, limit)
+        } else {
+            context_length_json_error(StatusCode::BAD_REQUEST, &message)
+        }
     }
 
     async fn proxy_stream_request(
@@ -1051,9 +1320,15 @@ impl GatewayManager {
                 } else {
                     ProviderHealth::Disabled
                 };
-                entry.last_checked_at = Some(Utc::now());
+                let now = Utc::now();
+                entry.last_checked_at = Some(now);
+                entry.last_success_at = Some(now);
                 entry.cooldown_until = None;
+                entry.next_probe_at = None;
                 entry.consecutive_failures = 0;
+                entry.auth_failure_count = 0;
+                entry.transient_failure_count = 0;
+                entry.error_kind = None;
                 entry.last_error = None;
                 entry.last_status = status;
                 if let Some(ms) = latency_ms {
@@ -1086,6 +1361,8 @@ impl GatewayManager {
                 entry.last_error = Some(error);
                 entry.health = ProviderHealth::Degraded;
                 entry.cooldown_until = None;
+                entry.next_probe_at = None;
+                entry.error_kind = Some(ErrorKind::Unknown.as_str().to_string());
             })
             .await
     }
@@ -1097,7 +1374,7 @@ impl GatewayManager {
         error: String,
     ) -> Result<()> {
         let id = provider.id.clone();
-        let cooldown_secs = self.inner.storage.config().await.routing.cooldown_secs;
+        let routing = self.inner.storage.config().await.routing;
         self.inner
             .storage
             .update_runtime_state(|state| {
@@ -1108,20 +1385,67 @@ impl GatewayManager {
                         provider_id: id.clone(),
                         ..Default::default()
                     });
-                entry.last_checked_at = Some(Utc::now());
+                let now = Utc::now();
+                entry.last_checked_at = Some(now);
                 entry.consecutive_failures += 1;
                 entry.last_error = Some(error.clone());
                 entry.last_status = status;
-                entry.health = match status {
-                    Some(401) | Some(403) => ProviderHealth::AuthFailed,
-                    Some(402) | Some(429) => ProviderHealth::CoolingDown,
-                    Some(s) if s >= 500 => ProviderHealth::CoolingDown,
-                    _ if entry.consecutive_failures >= 3 => ProviderHealth::CoolingDown,
-                    _ => ProviderHealth::Degraded,
-                };
+                let next_auth_failure_count =
+                    if classify_error_kind(status, &error) == ErrorKind::AuthFailed {
+                        entry.auth_failure_count.saturating_add(1)
+                    } else {
+                        0
+                    };
+                let classification = classify_provider_failure(
+                    status,
+                    &error,
+                    entry.consecutive_failures,
+                    next_auth_failure_count,
+                    &routing,
+                );
+                entry.health = classification.health;
+                entry.error_kind = Some(classification.kind.as_str().to_string());
+                if matches!(
+                    classification.kind,
+                    ErrorKind::AuthSuspect | ErrorKind::AuthFailed
+                ) {
+                    entry.auth_failure_count += 1;
+                } else {
+                    entry.auth_failure_count = 0;
+                }
+                if matches!(
+                    classification.kind,
+                    ErrorKind::Quota
+                        | ErrorKind::RateLimit
+                        | ErrorKind::Upstream5xx
+                        | ErrorKind::Network
+                        | ErrorKind::Unknown
+                ) {
+                    entry.transient_failure_count += 1;
+                } else {
+                    entry.transient_failure_count = 0;
+                }
                 if matches!(entry.health, ProviderHealth::CoolingDown) {
+                    entry.cooldown_until = Some(
+                        now + ChronoDuration::seconds(
+                            failure_cooldown_secs(&routing, entry.transient_failure_count).max(5),
+                        ),
+                    );
+                    entry.next_probe_at = entry.cooldown_until;
+                } else if matches!(classification.kind, ErrorKind::AuthSuspect) {
                     entry.cooldown_until =
-                        Some(Utc::now() + ChronoDuration::seconds(cooldown_secs.max(5)));
+                        Some(now + ChronoDuration::seconds(routing.cooldown_secs.max(5)));
+                    entry.next_probe_at = entry.cooldown_until;
+                } else if matches!(entry.health, ProviderHealth::AuthFailed) {
+                    entry.cooldown_until = None;
+                    entry.next_probe_at = Some(
+                        now + ChronoDuration::seconds(
+                            auth_probe_delay_secs(&routing, entry.auth_failure_count).max(5),
+                        ),
+                    );
+                } else {
+                    entry.cooldown_until = None;
+                    entry.next_probe_at = None;
                 }
             })
             .await
@@ -1130,6 +1454,15 @@ impl GatewayManager {
 
 async fn health_handler(State(state): State<GatewayAppState>) -> Json<Value> {
     Json(json!({ "ok": true, "status": state.manager.status().await }))
+}
+
+async fn read_limited_response_text(resp: reqwest::Response, limit: usize) -> String {
+    resp.text()
+        .await
+        .unwrap_or_default()
+        .chars()
+        .take(limit)
+        .collect()
 }
 
 async fn list_models_handler(State(state): State<GatewayAppState>, headers: HeaderMap) -> Response {
@@ -1147,7 +1480,17 @@ async fn list_models_handler(State(state): State<GatewayAppState>, headers: Head
         }
     }
     data.sort_by(|a, b| a.id.cmp(&b.id));
-    let catalog_models: Vec<Value> = data.iter().map(codex_catalog_model).collect();
+    let auto_compact_token_limit = state
+        .manager
+        .storage()
+        .config()
+        .await
+        .gateway
+        .codex_auto_compact_token_limit;
+    let catalog_models: Vec<Value> = data
+        .iter()
+        .map(|model| codex_catalog_model(model, auto_compact_token_limit))
+        .collect();
     Json(json!({
         "object": "list",
         "data": data,
@@ -1231,14 +1574,19 @@ pub fn join_url(base: &str, path: &str) -> String {
 }
 
 fn should_failover_status(status: StatusCode, body_preview: Option<&str>) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::PAYMENT_REQUIRED
-        || status == StatusCode::UNAUTHORIZED
-        || status == StatusCode::FORBIDDEN
-        || status == StatusCode::PAYLOAD_TOO_LARGE
-        || status.is_server_error()
+    let body = body_preview.unwrap_or_default();
+    let kind = classify_error_kind(Some(status.as_u16()), body);
+    matches!(
+        kind,
+        ErrorKind::AuthFailed
+            | ErrorKind::Permission
+            | ErrorKind::Quota
+            | ErrorKind::RateLimit
+            | ErrorKind::Upstream5xx
+            | ErrorKind::Network
+    ) || status == StatusCode::PAYLOAD_TOO_LARGE
         || (matches!(status, StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST)
-            && looks_like_model_routing_error(body_preview.unwrap_or_default()))
+            && looks_like_model_routing_error(body))
 }
 
 fn looks_like_model_routing_error(text: &str) -> bool {
@@ -1258,9 +1606,238 @@ fn looks_like_model_routing_error(text: &str) -> bool {
             || lower.contains("无效"))
 }
 
+#[cfg(test)]
+fn classify_provider_failure_health(
+    status: Option<u16>,
+    error: &str,
+    consecutive_failures: u32,
+) -> ProviderHealth {
+    classify_provider_failure(
+        status,
+        error,
+        consecutive_failures,
+        RoutingConfig::default().auth_failure_threshold,
+        &RoutingConfig::default(),
+    )
+    .health
+}
+
+fn classify_provider_failure(
+    status: Option<u16>,
+    error: &str,
+    consecutive_failures: u32,
+    next_auth_failure_count: u32,
+    routing: &RoutingConfig,
+) -> FailureClassification {
+    let kind = classify_error_kind(status, error);
+    if kind == ErrorKind::AuthFailed {
+        return if next_auth_failure_count >= routing.auth_failure_threshold.max(1) {
+            FailureClassification {
+                health: ProviderHealth::AuthFailed,
+                kind,
+            }
+        } else {
+            FailureClassification {
+                health: ProviderHealth::Degraded,
+                kind: ErrorKind::AuthSuspect,
+            }
+        };
+    }
+
+    if matches!(
+        kind,
+        ErrorKind::Quota | ErrorKind::RateLimit | ErrorKind::Upstream5xx | ErrorKind::Network
+    ) {
+        return FailureClassification {
+            health: ProviderHealth::CoolingDown,
+            kind,
+        };
+    }
+
+    if kind == ErrorKind::Permission {
+        return FailureClassification {
+            health: ProviderHealth::Degraded,
+            kind,
+        };
+    }
+
+    if consecutive_failures >= 3 {
+        return FailureClassification {
+            health: ProviderHealth::CoolingDown,
+            kind,
+        };
+    }
+
+    FailureClassification {
+        health: ProviderHealth::Degraded,
+        kind,
+    }
+}
+
+#[cfg(test)]
+fn is_persistent_auth_failure(status: Option<u16>, error: Option<&str>) -> bool {
+    classify_error_kind(status, error.unwrap_or_default()) == ErrorKind::AuthFailed
+}
+
+fn classify_error_kind(status: Option<u16>, error: &str) -> ErrorKind {
+    let lower = error.to_ascii_lowercase();
+    let inferred_status = status.or_else(|| extract_status_code(&lower));
+    if (matches!(inferred_status, Some(401))
+        || (matches!(inferred_status, Some(403)) && looks_like_auth_error(&lower)))
+        && !looks_like_permission_error(&lower)
+    {
+        return ErrorKind::AuthFailed;
+    }
+    if matches!(inferred_status, Some(403)) || looks_like_permission_error(&lower) {
+        return ErrorKind::Permission;
+    }
+    if matches!(inferred_status, Some(402)) || looks_like_quota_error(&lower) {
+        return ErrorKind::Quota;
+    }
+    if matches!(inferred_status, Some(429)) || looks_like_rate_limit_error(&lower) {
+        return ErrorKind::RateLimit;
+    }
+    if matches!(inferred_status, Some(s) if s >= 500) {
+        return ErrorKind::Upstream5xx;
+    }
+    if inferred_status.is_none() && looks_like_network_error(&lower) {
+        return ErrorKind::Network;
+    }
+    ErrorKind::Unknown
+}
+
+fn extract_status_code(lower: &str) -> Option<u16> {
+    lower
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter_map(|part| part.parse::<u16>().ok())
+        .find(|code| (400..=599).contains(code))
+}
+
+fn looks_like_auth_error(lower: &str) -> bool {
+    lower.contains("invalid_api_key")
+        || lower.contains("invalid api key")
+        || lower.contains("incorrect api key")
+        || lower.contains("api key is invalid")
+        || lower.contains("authentication failed")
+        || lower.contains("authentication error")
+        || lower.contains("authentication_error")
+        || lower.contains("auth failed")
+        || lower.contains("invalid token")
+        || lower.contains("bearer token")
+        || lower.contains("token is expired")
+        || lower.contains("token has expired")
+        || lower.contains("token is invalid")
+        || lower.contains("access token")
+            && (lower.contains("invalid") || lower.contains("expired") || lower.contains("missing"))
+        || lower.contains("unauthorized")
+        || lower.contains("invalid credentials")
+        || lower.contains("认证失败")
+        || lower.contains("鉴权失败")
+        || lower.contains("未授权")
+        || (lower.contains("密钥") && (lower.contains("无效") || lower.contains("错误")))
+}
+
+fn looks_like_permission_error(lower: &str) -> bool {
+    lower.contains("permission_error")
+        || lower.contains("permission denied")
+        || lower.contains("not enabled")
+        || lower.contains("not allowed")
+        || lower.contains("forbidden")
+        || lower.contains("group")
+            && (lower.contains("not enabled") || lower.contains("permission"))
+        || lower.contains("权限")
+        || lower.contains("分组")
+}
+
+fn looks_like_quota_error(lower: &str) -> bool {
+    lower.contains("insufficient_quota")
+        || lower.contains("quota exceeded")
+        || lower.contains("insufficient balance")
+        || lower.contains("balance is not enough")
+        || lower.contains("额度不足")
+        || lower.contains("余额不足")
+}
+
+fn looks_like_rate_limit_error(lower: &str) -> bool {
+    lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("限流")
+}
+
+fn looks_like_network_error(lower: &str) -> bool {
+    lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("connection")
+        || lower.contains("connect")
+        || lower.contains("dns")
+        || lower.contains("network")
+        || lower.contains("tcp")
+        || lower.contains("tls")
+        || lower.contains("网络")
+}
+
+fn failure_cooldown_secs(routing: &RoutingConfig, transient_failure_count: u32) -> i64 {
+    let base = routing.cooldown_secs.max(5);
+    let multiplier = 2_i64.pow(transient_failure_count.saturating_sub(1).min(4));
+    base.saturating_mul(multiplier)
+        .min(routing.max_cooldown_secs.max(base))
+}
+
+fn auth_probe_delay_secs(routing: &RoutingConfig, auth_failure_count: u32) -> i64 {
+    let base = routing
+        .probe_interval_secs
+        .max(routing.cooldown_secs)
+        .max(5);
+    let multiplier = 2_i64.pow(auth_failure_count.saturating_sub(1).min(3));
+    base.saturating_mul(multiplier)
+        .min(routing.max_cooldown_secs.max(base))
+}
+
 fn max_request_body_bytes(max_request_body_mb: u64) -> usize {
     let bytes = max_request_body_mb.max(1).saturating_mul(1024 * 1024);
     bytes.min(usize::MAX as u64) as usize
+}
+
+fn codex_context_body_limit_bytes(limit_mb: u64, subagent_kind: Option<&str>) -> Option<usize> {
+    if limit_mb == 0 {
+        return None;
+    }
+    let multiplier = match subagent_kind {
+        Some("compact" | "memory_consolidation") => 4,
+        Some(_) => 2,
+        None => 1,
+    };
+    Some(max_request_body_bytes(limit_mb.saturating_mul(multiplier)))
+}
+
+fn is_codex_context_guard_path(path: &str) -> bool {
+    matches!(
+        path.trim_start_matches('/'),
+        "responses" | "chat/completions" | "responses/compact"
+    )
+}
+
+fn codex_subagent_kind(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-openai-subagent")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
+fn codex_context_limit_message(size: u64, limit: usize) -> String {
+    format!(
+        "Other Model local context guard blocked an oversized Codex request: received {} bytes, soft limit is {} bytes ({} MB). Please compact/summarize the thread context and retry; the gateway will not forward this huge request upstream.",
+        size,
+        limit,
+        limit / 1024 / 1024
+    )
 }
 
 fn content_length(headers: &HeaderMap) -> Option<u64> {
@@ -1374,6 +1951,66 @@ fn json_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+fn context_length_json_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn context_length_exceeded_sse_response(message: &str, size: u64, limit: usize) -> Response {
+    let payload = json!({
+        "type": "response.failed",
+        "sequence_number": 1,
+        "response": {
+            "id": format!("resp_local_context_{}", uuid::Uuid::new_v4().simple()),
+            "object": "response",
+            "created_at": Utc::now().timestamp(),
+            "status": "failed",
+            "background": false,
+            "error": {
+                "code": "context_length_exceeded",
+                "message": message
+            },
+            "usage": null,
+            "user": null,
+            "metadata": {
+                "gateway": "other_model",
+                "body_size_bytes": size,
+                "body_limit_bytes": limit,
+                "action": "compact_context_and_retry"
+            }
+        }
+    });
+    let body = Bytes::from(format!("event: response.failed\ndata: {payload}\n\n"));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-other-model-context-guard"),
+        HeaderValue::from_static("context_length_exceeded"),
+    );
+    headers.insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&body.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    (StatusCode::OK, headers, body).into_response()
+}
+
 fn compact_json(value: &Value) -> String {
     value.to_string().chars().take(700).collect()
 }
@@ -1424,7 +2061,8 @@ fn escape_json_string(input: &str) -> String {
         .replace('\r', "\\r")
 }
 
-fn codex_catalog_model(model: &ModelInfo) -> Value {
+fn codex_catalog_model(model: &ModelInfo, auto_compact_token_limit: i64) -> Value {
+    let auto_compact_token_limit = auto_compact_token_limit.clamp(1_000, 244_800);
     json!({
         "slug": model.id,
         "display_name": model.id,
@@ -1463,6 +2101,7 @@ fn codex_catalog_model(model: &ModelInfo) -> Value {
         "supports_parallel_tool_calls": true,
         "context_window": 272000,
         "max_context_window": 1000000,
+        "auto_compact_token_limit": auto_compact_token_limit,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
         "reasoning_summary_format": "experimental",
@@ -1510,6 +2149,21 @@ mod tests {
         assert!(!is_stream_request(br#"{"stream":false}"#));
     }
 
+    #[test]
+    fn codex_catalog_advertises_auto_compact_limit() {
+        let model = ModelInfo {
+            id: "gpt-5.5".to_string(),
+            ..Default::default()
+        };
+        let value = codex_catalog_model(&model, 123_456);
+        assert_eq!(
+            value
+                .get("auto_compact_token_limit")
+                .and_then(Value::as_i64),
+            Some(123_456)
+        );
+    }
+
     #[tokio::test]
     async fn round_robin_can_be_enabled_and_disabled() {
         let upstream_a = upstream_json(200, json!({"id": "resp_a", "object": "response"})).await;
@@ -1523,6 +2177,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: None,
             },
         )
@@ -1552,6 +2209,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: None,
             },
         )
@@ -1587,6 +2247,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: None,
             },
         )
@@ -1612,6 +2275,9 @@ mod tests {
                 auto_failover: false,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: None,
             },
         )
@@ -1646,6 +2312,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: Some("b".to_string()),
             },
         )
@@ -1681,6 +2350,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: Some("b".to_string()),
             },
         )
@@ -1717,6 +2389,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: None,
             },
         )
@@ -1748,6 +2423,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: None,
             },
         )
@@ -1779,6 +2457,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: None,
             },
         )
@@ -1798,6 +2479,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_error_does_not_mark_auth_failed_and_can_retry_later() {
+        let permission_error = upstream_json(
+            403,
+            json!({"error": {"message": "Image generation is not enabled for this group", "type": "permission_error"}}),
+        )
+        .await;
+        let healthy = upstream_json(200, json!({"id": "resp_ok", "object": "response"})).await;
+        let manager = test_manager(
+            &permission_error,
+            &healthy,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                auth_headers(),
+                Bytes::from_static(br#"{"model":"gpt-test","input":"ping"}"#),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let runtime = manager.inner.storage.runtime_state().await;
+        let state = runtime.providers.get("a").unwrap();
+        assert_eq!(state.health, ProviderHealth::Degraded);
+        assert_eq!(state.error_kind.as_deref(), Some("permission"));
+        assert_eq!(state.auth_failure_count, 0);
+        assert!(state.cooldown_until.is_none());
+
+        let ordered = manager.ordered_providers(None, false, None).await;
+        assert_eq!(ordered.first().map(|p| p.id.as_str()), Some("b"));
+        assert!(ordered.iter().any(|p| p.id == "a"));
+    }
+
+    #[tokio::test]
+    async fn invalid_key_requires_threshold_before_auth_failed() {
+        let invalid_key = upstream_json(
+            401,
+            json!({"error": {"message": "invalid_api_key", "type": "invalid_request_error"}}),
+        )
+        .await;
+        let healthy = upstream_json(200, json!({"id": "resp_ok", "object": "response"})).await;
+        let manager = test_manager(
+            &invalid_key,
+            &healthy,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                auth_headers(),
+                Bytes::from_static(br#"{"model":"gpt-test","input":"ping"}"#),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let runtime = manager.inner.storage.runtime_state().await;
+        let state = runtime.providers.get("a").unwrap();
+        assert_eq!(state.health, ProviderHealth::Degraded);
+        assert_eq!(state.error_kind.as_deref(), Some("auth_suspect"));
+        assert_eq!(state.auth_failure_count, 1);
+        assert!(state.cooldown_until.is_some());
+
+        let provider_a = {
+            let cfg = manager.inner.storage.config().await;
+            cfg.providers[0].clone()
+        };
+        manager
+            .record_provider_failure(&provider_a, Some(401), "invalid_api_key".to_string())
+            .await
+            .unwrap();
+        let runtime = manager.inner.storage.runtime_state().await;
+        let state = runtime.providers.get("a").unwrap();
+        assert_eq!(state.health, ProviderHealth::AuthFailed);
+        assert_eq!(state.error_kind.as_deref(), Some("auth_failed"));
+        assert_eq!(state.auth_failure_count, 2);
+        assert!(state.next_probe_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn due_auth_failed_provider_is_probed_and_restored() {
+        let upstream_a = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": []
+            })))
+            .mount(&upstream_a)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_a",
+                "object": "response"
+            })))
+            .mount(&upstream_a)
+            .await;
+
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(
+            &upstream_a,
+            &upstream_b,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 1,
+                max_cooldown_secs: 600,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+        manager
+            .inner
+            .storage
+            .update_runtime_state(|runtime| {
+                runtime.providers.insert(
+                    "a".to_string(),
+                    ProviderState {
+                        provider_id: "a".to_string(),
+                        health: ProviderHealth::AuthFailed,
+                        error_kind: Some("auth_failed".to_string()),
+                        next_probe_at: Some(Utc::now() - ChronoDuration::seconds(1)),
+                        auth_failure_count: 2,
+                        ..Default::default()
+                    },
+                );
+            })
+            .await
+            .unwrap();
+
+        let ordered = manager.ordered_providers(None, false, None).await;
+        assert_eq!(ordered.first().map(|p| p.id.as_str()), Some("a"));
+        let runtime = manager.inner.storage.runtime_state().await;
+        let state = runtime.providers.get("a").unwrap();
+        assert_eq!(state.health, ProviderHealth::Healthy);
+        assert_eq!(state.auth_failure_count, 0);
+        assert!(state.next_probe_at.is_none());
+    }
+
+    #[test]
+    fn classifies_403_permission_errors_as_degraded_not_auth_failed() {
+        let health = classify_provider_failure_health(
+            Some(403),
+            r#"upstream 词元.fast returned 403 before stream output: {"error":{"message":"Image generation is not enabled for this group","type":"permission_error"}}"#,
+            1,
+        );
+        assert_eq!(health, ProviderHealth::Degraded);
+    }
+
+    #[test]
+    fn classifies_403_invalid_key_as_auth_failed() {
+        let health = classify_provider_failure_health(
+            Some(403),
+            r#"{"error":{"message":"invalid_api_key","type":"invalid_request_error"}}"#,
+            1,
+        );
+        assert_eq!(health, ProviderHealth::AuthFailed);
+    }
+
+    #[test]
+    fn first_invalid_key_is_auth_suspect_until_threshold() {
+        let routing = RoutingConfig {
+            auth_failure_threshold: 2,
+            ..RoutingConfig::default()
+        };
+        let first = classify_provider_failure(
+            Some(401),
+            r#"{"error":{"message":"invalid_api_key"}}"#,
+            1,
+            1,
+            &routing,
+        );
+        assert_eq!(first.health, ProviderHealth::Degraded);
+        assert_eq!(first.kind, ErrorKind::AuthSuspect);
+
+        let second = classify_provider_failure(
+            Some(401),
+            r#"{"error":{"message":"invalid_api_key"}}"#,
+            2,
+            2,
+            &routing,
+        );
+        assert_eq!(second.health, ProviderHealth::AuthFailed);
+        assert_eq!(second.kind, ErrorKind::AuthFailed);
+    }
+
+    #[test]
+    fn transient_failures_enter_cooling_down() {
+        let routing = RoutingConfig {
+            cooldown_secs: 10,
+            max_cooldown_secs: 60,
+            ..RoutingConfig::default()
+        };
+        let cases = [
+            (Some(503), "upstream unavailable", ErrorKind::Upstream5xx),
+            (Some(429), "too many requests", ErrorKind::RateLimit),
+            (Some(402), "insufficient balance", ErrorKind::Quota),
+            (None, "request timeout while connecting", ErrorKind::Network),
+        ];
+        for (status, body, kind) in cases {
+            let classification = classify_provider_failure(status, body, 1, 0, &routing);
+            assert_eq!(classification.health, ProviderHealth::CoolingDown);
+            assert_eq!(classification.kind, kind);
+        }
+    }
+
+    #[test]
+    fn auth_failed_provider_is_only_skipped_for_persistent_auth_errors() {
+        assert!(is_persistent_auth_failure(
+            Some(403),
+            Some(r#"{"error":{"message":"invalid_api_key"}}"#),
+        ));
+        assert!(!is_persistent_auth_failure(
+            Some(403),
+            Some(
+                r#"{"error":{"message":"Image generation is not enabled for this group","type":"permission_error"}}"#
+            ),
+        ));
+    }
+
+    #[tokio::test]
     async fn http_gateway_accepts_large_bodies_above_axum_default() {
         let upstream_a =
             upstream_json(200, json!({"id": "resp_large", "object": "response"})).await;
@@ -1810,6 +2740,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: None,
             },
         )
@@ -1856,6 +2789,9 @@ mod tests {
                 auto_failover: true,
                 max_attempts_per_request: 2,
                 cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
                 selected_provider_id: None,
             },
         )
@@ -1891,6 +2827,76 @@ mod tests {
         let _ = manager.stop().await;
     }
 
+    #[tokio::test]
+    async fn codex_context_guard_returns_sse_context_length_exceeded_before_upstream() {
+        let upstream_a =
+            upstream_json(200, json!({"id": "resp_large", "object": "response"})).await;
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(
+            &upstream_a,
+            &upstream_b,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+        manager
+            .inner
+            .storage
+            .update_config(|cfg| {
+                cfg.gateway.codex_context_body_limit_mb = 1;
+            })
+            .await
+            .unwrap();
+        let mut headers = auth_headers();
+        headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let payload = json!({
+            "model": "gpt-test",
+            "input": "x".repeat(2 * 1024 * 1024),
+            "stream": true,
+            "max_output_tokens": 1
+        });
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                headers,
+                Bytes::from(payload.to_string()),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("event: response.failed"));
+        assert!(text.contains("\"code\":\"context_length_exceeded\""));
+        assert!(text.contains("compact"));
+        assert_eq!(request_count(&upstream_a).await, 0);
+
+        let logs = manager.inner.storage.read_logs(10).await.unwrap();
+        let entry = logs.last().unwrap();
+        assert_eq!(entry.error_kind.as_deref(), Some("context_too_large"));
+        assert!(entry.local_rejected);
+        assert!(entry.streamed);
+    }
+
     async fn upstream_json(status: u16, body: Value) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1917,6 +2923,8 @@ mod tests {
             request_timeout_secs: 30,
             stream_idle_timeout_secs: 30,
             max_request_body_mb: 512,
+            codex_context_body_limit_mb: 32,
+            codex_auto_compact_token_limit: 120_000,
         };
         cfg.local_auth_token = "test-token".to_string();
         cfg.routing = routing;

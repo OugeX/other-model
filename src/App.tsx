@@ -16,7 +16,7 @@ import type {
   Tab,
   TestResult,
 } from './types';
-import { flattenModels, gptModelsFromCache, healthClass, healthLabel, isGptModel, mask, modelsForProvider, newProvider } from './utils';
+import { flattenModels, gptModelsFromCache, healthClass, isGptModel, mask, modelsForProvider, newProvider, providerStateSummary } from './utils';
 import './styles.css';
 
 const PAGE_SIZE = 10;
@@ -320,7 +320,7 @@ function Dashboard({ status, providers, models, logs }: { status: GatewayStatus 
         <h3>供应商状态</h3>
         <div className="provider-pills">
           {providers.map((p) => (
-            <span key={p.config.id} className={`pill ${healthClass(p.state.health)}`}>{p.config.name}: {healthLabel(p.state.health)}</span>
+            <span key={p.config.id} className={`pill ${healthClass(p.state.health)}`}>{p.config.name}: {providerStateSummary(p.state)}</span>
           ))}
         </div>
       </div>
@@ -416,7 +416,7 @@ function Providers({ providers, cache, busy, runBusy, notify }: { providers: Pro
                   <td><strong>{p.config.name}</strong><br/><small>{p.config.enabled ? '启用' : '禁用'}</small></td>
                   <td><code>{p.config.base_url}</code></td>
                   <td>{mask(p.config.api_key)}</td>
-                  <td><span className={`pill ${healthClass(p.state.health)}`}>{healthLabel(p.state.health)}</span></td>
+                  <td><span className={`pill ${healthClass(p.state.health)}`}>{providerStateSummary(p.state)}</span></td>
                   <td>{p.gpt_model_count} 个（GPT-5.4/5.5）</td>
                   <td className="truncate">
                     {result ? `${result.model ?? '模型'}：${result.ok ? '可用' : '失败'} ${result.status ?? ''} ${result.error ?? ''}` : (p.state.last_error ?? '-')}
@@ -723,7 +723,7 @@ function Quota({ providers, busy, runBusy, notify }: { providers: ProviderView[]
           return (
             <div className="card" key={p.config.id}>
               <h3>{p.config.name}</h3>
-              <p><span className={`pill ${healthClass(p.state.health)}`}>{healthLabel(p.state.health)}</span></p>
+              <p><span className={`pill ${healthClass(p.state.health)}`}>{providerStateSummary(p.state)}</span></p>
               <p>查询方式：{modeLabel}</p>
               <p>余额：{result?.balance ?? p.state.remaining_hint ?? result?.health_hint ?? '未查询/未配置适配器'}</p>
               {result?.health_hint && <p className="inline-help">{result.health_hint}</p>}
@@ -747,7 +747,7 @@ function Logs({ logs }: { logs: RequestLogEntry[] }) {
         <tbody>
           {pageItems.map((l) => (
             <tr key={l.id}>
-              <td>{new Date(l.timestamp).toLocaleString()}</td><td>{l.method}</td><td><code>{l.path}</code></td><td>{l.model ?? '-'}</td><td>{l.provider_name ?? (l.local_rejected ? '本地拒绝' : '-')}</td><td>{l.status ?? '-'}</td><td>{formatBytes(l.body_size_bytes)}</td><td>{l.latency_ms}ms</td><td className="truncate">{l.error ?? l.failover_reason ?? '-'}</td>
+              <td>{new Date(l.timestamp).toLocaleString()}</td><td>{l.method}</td><td><code>{l.path}</code></td><td>{l.model ?? '-'}</td><td>{l.provider_name ?? (l.local_rejected ? (l.error_kind === 'context_too_large' ? '本地压缩提示' : '本地拒绝') : '-')}</td><td>{l.status ?? '-'}</td><td>{formatBytes(l.body_size_bytes)}</td><td>{l.latency_ms}ms</td><td className="truncate">{l.error_kind ? `${l.error_kind}: ` : ''}{l.error ?? l.failover_reason ?? '-'}</td>
             </tr>
           ))}
           {!logs.length && <tr><td colSpan={9}>暂无请求日志。</td></tr>}
@@ -887,8 +887,13 @@ function Settings({
           <label>非流式超时秒<input type="number" value={config.gateway.request_timeout_secs} onChange={(e) => update({ gateway: { ...config.gateway, request_timeout_secs: Number(e.target.value) || 300 } })} /></label>
           <label>流式闲置超时秒<input type="number" value={config.gateway.stream_idle_timeout_secs} onChange={(e) => update({ gateway: { ...config.gateway, stream_idle_timeout_secs: Number(e.target.value) || 300 } })} /></label>
           <label>最大请求体 MB<input type="number" value={config.gateway.max_request_body_mb} onChange={(e) => update({ gateway: { ...config.gateway, max_request_body_mb: Number(e.target.value) || 512 } })} /></label>
+          <label>Codex 上下文软限 MB<input type="number" value={config.gateway.codex_context_body_limit_mb ?? 32} onChange={(e) => update({ gateway: { ...config.gateway, codex_context_body_limit_mb: Number(e.target.value) || 0 } })} /></label>
+          <label>Codex 自动压缩 token<input type="number" value={config.gateway.codex_auto_compact_token_limit ?? 120000} onChange={(e) => update({ gateway: { ...config.gateway, codex_auto_compact_token_limit: Number(e.target.value) || 120000 } })} /></label>
           <label>最大重试<input type="number" value={config.routing.max_attempts_per_request} onChange={(e) => update({ routing: { ...config.routing, max_attempts_per_request: Number(e.target.value) || 1 } })} /></label>
-          <label>冷却秒<input type="number" value={config.routing.cooldown_secs} onChange={(e) => update({ routing: { ...config.routing, cooldown_secs: Number(e.target.value) || 60 } })} /></label>
+          <label>基础冷却秒<input type="number" value={config.routing.cooldown_secs} onChange={(e) => update({ routing: { ...config.routing, cooldown_secs: Number(e.target.value) || 60 } })} /></label>
+          <label>认证失败阈值<input type="number" value={config.routing.auth_failure_threshold ?? 2} onChange={(e) => update({ routing: { ...config.routing, auth_failure_threshold: Number(e.target.value) || 2 } })} /></label>
+          <label>探活间隔秒<input type="number" value={config.routing.probe_interval_secs ?? 300} onChange={(e) => update({ routing: { ...config.routing, probe_interval_secs: Number(e.target.value) || 300 } })} /></label>
+          <label>最大冷却秒<input type="number" value={config.routing.max_cooldown_secs ?? 600} onChange={(e) => update({ routing: { ...config.routing, max_cooldown_secs: Number(e.target.value) || 600 } })} /></label>
         </div>
         <label><input type="checkbox" checked={config.routing.auto_round_robin ?? true} onChange={(e) => update({ routing: { ...config.routing, auto_round_robin: e.target.checked } })} /> 自动轮询供应商（开启后每个新请求按供应商池轮询）</label>
         <label>单选供应商（关闭自动轮询后生效）
@@ -902,7 +907,8 @@ function Settings({
           </select>
         </label>
         {(config.routing.auto_round_robin ?? true) && <p className="inline-help">自动轮询开启时会忽略单选供应商。</p>}
-        <label><input type="checkbox" checked={config.routing.auto_failover ?? true} onChange={(e) => update({ routing: { ...config.routing, auto_failover: e.target.checked } })} /> 自动切换供应商（开启后上游 401/402/429/5xx/模型错误会尝试下一个）</label>
+        <p className="inline-help">Codex 上下文软限只拦截 <code>/v1/responses</code> / <code>/v1/chat/completions</code> 的超大上下文请求，并向 Codex 回传 <code>context_length_exceeded</code> 促使客户端压缩上下文；设为 0 可关闭。</p>
+        <label><input type="checkbox" checked={config.routing.auto_failover ?? true} onChange={(e) => update({ routing: { ...config.routing, auto_failover: e.target.checked } })} /> 自动切换供应商（开启后认证异常、权限限制、余额/限流、5xx、模型错误会尝试下一个）</label>
         <label><input type="checkbox" checked={config.gateway.require_local_token} onChange={(e) => update({ gateway: { ...config.gateway, require_local_token: e.target.checked } })} /> 要求本地 Authorization token</label>
         <label>本地 Token<input value={config.local_auth_token} onChange={(e) => update({ local_auth_token: e.target.value })} /></label>
         <div className="section-actions">

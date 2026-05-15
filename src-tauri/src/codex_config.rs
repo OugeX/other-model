@@ -56,6 +56,9 @@ pub async fn configure_codex_at_path(
     let provider_name = existing_or_requested_provider(&doc, req.provider_name.as_deref());
     doc["model"] = value(req.model.trim());
     doc["model_provider"] = value(provider_name.as_str());
+    if let Some(limit) = req.auto_compact_token_limit.filter(|limit| *limit > 0) {
+        doc["model_auto_compact_token_limit"] = value(limit);
+    }
 
     if !doc.as_table().contains_key("model_providers") || !doc["model_providers"].is_table() {
         doc["model_providers"] = Item::Table(Table::new());
@@ -337,6 +340,7 @@ experimental_bearer_token = "old-token"
             ConfigureCodexRequest {
                 model: "gpt-5.5".to_string(),
                 provider_name: None,
+                auto_compact_token_limit: None,
             },
             "http://127.0.0.1:14555/v1".to_string(),
             "local-token".to_string(),
@@ -368,6 +372,7 @@ experimental_bearer_token = "old-token"
             ConfigureCodexRequest {
                 model: "gpt-5.5".to_string(),
                 provider_name: None,
+                auto_compact_token_limit: None,
             },
             "http://127.0.0.1:14555/v1".to_string(),
             "local-token".to_string(),
@@ -389,6 +394,7 @@ experimental_bearer_token = "old-token"
             ConfigureCodexRequest {
                 model: "gpt-5.5".to_string(),
                 provider_name: None,
+                auto_compact_token_limit: None,
             },
             "http://127.0.0.1:14555/v1".to_string(),
             "local-token".to_string(),

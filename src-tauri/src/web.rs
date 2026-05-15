@@ -89,6 +89,7 @@ pub struct CodexSnippetResponse {
     pub model: String,
     pub base_url: String,
     pub bearer_token: String,
+    pub auto_compact_token_limit: i64,
     pub config_toml: String,
     pub configure_script: String,
     pub download_name: String,
@@ -816,9 +817,11 @@ fn codex_snippet(status: &GatewayStatus, cfg: &AppConfig, model: String) -> Code
     let provider_name = "other_model_web";
     let base_url = status.bind_url.clone();
     let token = cfg.local_auth_token.clone();
+    let auto_compact_token_limit = cfg.gateway.codex_auto_compact_token_limit;
     let config_toml = format!(
         r#"model = "{model}"
 model_provider = "{provider_name}"
+model_auto_compact_token_limit = {auto_compact_token_limit}
 
 [model_providers.{provider_name}]
 name = "Other Model Web"
@@ -851,6 +854,7 @@ echo "Restart your Codex CLI/terminal before testing."
         model,
         base_url,
         bearer_token: token,
+        auto_compact_token_limit,
         config_toml,
         configure_script,
         download_name: "configure-codex.sh".to_string(),

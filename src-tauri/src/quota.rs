@@ -688,7 +688,7 @@ fn value_to_string(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{BalanceAuthConfig, QuotaConfig};
+    use crate::models::{BalanceAuthConfig, ProviderCapabilities, QuotaConfig};
     use std::collections::BTreeMap;
     use wiremock::{
         matchers::{body_json, header, method, path},
@@ -707,6 +707,7 @@ mod tests {
             query: BTreeMap::new(),
             quota: None,
             balance_auth: None,
+            capabilities: ProviderCapabilities::infer_from_base_url("https://api.openai.com/v1"),
         }
     }
 

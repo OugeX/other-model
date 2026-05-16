@@ -9,6 +9,9 @@ export interface GatewayConfig {
   max_request_body_mb: number;
   codex_context_body_limit_mb: number;
   codex_auto_compact_token_limit: number;
+  codex_context_soft_token_limit: number;
+  codex_compact_retry_enabled: boolean;
+  codex_compact_max_attempts: number;
 }
 
 export interface RoutingConfig {
@@ -37,6 +40,12 @@ export interface BalanceAuthConfig {
   password?: string | null;
 }
 
+export interface ProviderCapabilities {
+  responses_api: boolean;
+  responses_compact: boolean;
+  token_count: boolean;
+}
+
 export interface ProviderConfig {
   id: string;
   name: string;
@@ -48,6 +57,7 @@ export interface ProviderConfig {
   query: Record<string, string>;
   quota?: QuotaConfig | null;
   balance_auth?: BalanceAuthConfig | null;
+  capabilities: ProviderCapabilities;
 }
 
 export interface AppConfig {
@@ -142,6 +152,11 @@ export interface RequestLogEntry {
   error_kind?: string | null;
   error?: string | null;
   usage?: unknown;
+  estimated_input_tokens?: number | null;
+  compacted?: boolean;
+  compact_attempted?: boolean;
+  compact_provider_name?: string | null;
+  compact_error?: string | null;
 }
 
 export interface TestResult {

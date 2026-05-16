@@ -34,7 +34,14 @@ fn main() {
         }
     }
 
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let worker_threads = std::thread::available_parallelism()
+        .map(|value| value.get().max(2))
+        .unwrap_or(2);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     if let Err(err) = runtime.block_on(other_model_lib::web::run_web_server(host, port)) {
         eprintln!("other-model-web failed: {err}");
         std::process::exit(1);

@@ -22,6 +22,9 @@ pub(crate) fn validate_provider(provider: &ProviderConfig) -> Result<()> {
     if !provider.base_url.starts_with("http://") && !provider.base_url.starts_with("https://") {
         return Err(anyhow!("base URL must start with http:// or https://"));
     }
+    if !provider.capabilities.responses_api {
+        return Err(anyhow!("provider must support responses API"));
+    }
     let balance_auth = provider.effective_balance_auth();
     match balance_auth.mode {
         BalanceAuthMode::Disabled => {}

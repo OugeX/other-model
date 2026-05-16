@@ -3,6 +3,7 @@ use crate::models::{
     ProviderState, RequestLogEntry, RoutingConfig,
 };
 use crate::storage::Storage;
+use crate::token_counter::{estimate_request_tokens, estimate_value_tokens};
 use anyhow::{anyhow, Context, Result};
 use async_stream::stream;
 use axum::{
@@ -66,6 +67,61 @@ struct UpstreamStreamResult {
     headers: HeaderMap,
     latency_ms: u128,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactFailureKind {
+    Retryable,
+    Failed,
+    ContextTooLarge,
+}
+
+#[derive(Debug, Clone)]
+struct CompactFailure {
+    kind: CompactFailureKind,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactTargetField {
+    Input,
+    Messages,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedCompaction {
+    replacement: Value,
+    compacted_body: Bytes,
+    estimated_tokens: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct ParsedRequestMeta {
+    model: Option<String>,
+    streamed: bool,
+}
+
+#[derive(Debug)]
+struct ParsedCompactionRequest {
+    value: Value,
+    model: Option<String>,
+    target: CompactTargetField,
+    original_context: Value,
+}
+
+#[derive(Debug)]
+struct CompactionItemPlan {
+    stable_items: Vec<Value>,
+    old_items: Vec<Value>,
+    recent_items: Vec<Value>,
+}
+
+const LOCAL_COMPACT_PRESERVE_RECENT_TURNS: usize = 4;
+const LOCAL_COMPACT_PRESERVE_RECENT_TOKEN_WINDOW: i64 = 24_000;
+const LOCAL_COMPACT_CHUNK_TOKEN_LIMIT: i64 = 32_000;
+const LOCAL_COMPACT_CHUNK_SUMMARY_TARGET: i64 = 2_048;
+const LOCAL_COMPACT_FINAL_SUMMARY_TARGET: i64 = 8_192;
+const LOCAL_COMPACT_MAX_ROUNDS: usize = 3;
+const LOCAL_COMPACT_RETRY_TARGET_TOKENS: i64 = 180_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ErrorKind {
@@ -164,6 +220,7 @@ impl GatewayManager {
             .route("/v1/models", get(list_models_handler))
             .route("/v1/models/:model", get(get_model_handler))
             .route("/v1/responses", post(responses_handler))
+            .route("/v1/responses/compact", post(compact_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/*path", any(proxy_handler))
             .layer(
@@ -270,13 +327,30 @@ impl GatewayManager {
             .send()
             .await?;
         let status = resp.status();
+        let headers = to_axum_headers(resp.headers());
         let value: Value = resp.json().await.unwrap_or_else(|_| json!({}));
         let latency = start.elapsed().as_millis();
         if !status.is_success() {
+            let preview = compact_json(&value);
+            if should_fallback_model_discovery_to_responses(status, &preview) {
+                if let Ok(models) = self
+                    .discover_supported_codex_models_via_responses(provider)
+                    .await
+                {
+                    self.record_provider_success(
+                        provider,
+                        Some(StatusCode::OK.as_u16()),
+                        Some(latency),
+                        None,
+                    )
+                    .await?;
+                    return Ok(models);
+                }
+            }
             return Err(anyhow!(
                 "models request failed with {}: {}",
                 status.as_u16(),
-                compact_json(&value)
+                preview
             ));
         }
         let data = value
@@ -310,10 +384,74 @@ impl GatewayManager {
             provider,
             Some(status.as_u16()),
             Some(latency),
-            rate_limit_hint(&HeaderMap::new()),
+            rate_limit_hint(&headers),
         )
         .await?;
         Ok(models)
+    }
+
+    async fn discover_supported_codex_models_via_responses(
+        &self,
+        provider: &ProviderConfig,
+    ) -> Result<Vec<ModelInfo>> {
+        let client = self.client_for_provider(provider).await?;
+        let url = join_url(&provider.base_url, "responses");
+        let mut models = Vec::new();
+        let mut last_error = None;
+
+        for model_id in ["gpt-5.5", "gpt-5.4"] {
+            let body = json!({
+                "model": model_id,
+                "input": "ping",
+                "max_output_tokens": 16,
+                "stream": false
+            });
+            match client
+                .post(url.clone())
+                .bearer_auth(&provider.api_key)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let preview = read_limited_response_text(resp, 700).await;
+                    if status.is_success() {
+                        models.push(ModelInfo {
+                            id: model_id.to_string(),
+                            object: Some("model".to_string()),
+                            created: None,
+                            owned_by: Some("responses_probe".to_string()),
+                            raw: json!({
+                                "id": model_id,
+                                "object": "model",
+                                "owned_by": "responses_probe",
+                                "discovered_via": "responses_probe"
+                            }),
+                        });
+                    } else {
+                        last_error = Some(format!(
+                            "responses probe {} failed with {}: {}",
+                            model_id,
+                            status.as_u16(),
+                            preview
+                        ));
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(format!("responses probe {} failed: {}", model_id, err));
+                }
+            }
+        }
+
+        if models.is_empty() {
+            Err(anyhow!(last_error.unwrap_or_else(|| {
+                "responses probe found no supported Codex models".to_string()
+            })))
+        } else {
+            models.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(models)
+        }
     }
 
     pub async fn test_provider_model(
@@ -605,6 +743,22 @@ impl GatewayManager {
             return Ok(());
         }
 
+        if should_fallback_model_discovery_to_responses(status, &raw)
+            && self
+                .discover_supported_codex_models_via_responses(provider)
+                .await
+                .is_ok()
+        {
+            self.record_provider_success(
+                provider,
+                Some(StatusCode::OK.as_u16()),
+                Some(start.elapsed().as_millis()),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+
         self.record_provider_failure(
             provider,
             Some(status.as_u16()),
@@ -650,27 +804,7 @@ impl GatewayManager {
             }
         }
 
-        let subagent_kind = codex_subagent_kind(&headers);
-        let context_guard_limit = if is_codex_context_guard_path(&path) {
-            codex_context_body_limit_bytes(cfg.gateway.codex_context_body_limit_mb, subagent_kind)
-        } else {
-            None
-        };
-        if let Some(soft_limit) = context_guard_limit {
-            if content_length(&headers).is_some_and(|size| size > soft_limit as u64) {
-                let size = content_length(&headers).unwrap_or(soft_limit as u64 + 1);
-                return self
-                    .reject_codex_context_length_before_read(
-                        method, path, headers, started, size, soft_limit,
-                    )
-                    .await;
-            }
-        }
-        let read_limit = context_guard_limit
-            .map(|soft_limit| soft_limit.saturating_add(1).min(limit))
-            .unwrap_or(limit);
-
-        match to_bytes(request.into_body(), read_limit).await {
+        match to_bytes(request.into_body(), limit).await {
             Ok(body) => {
                 self.proxy_request(method, path, headers, body, forced_provider_id)
                     .await
@@ -683,16 +817,6 @@ impl GatewayManager {
                     StatusCode::BAD_REQUEST
                 };
                 if status == StatusCode::PAYLOAD_TOO_LARGE {
-                    if let Some(soft_limit) = context_guard_limit {
-                        if soft_limit < limit {
-                            let size = content_length(&headers).unwrap_or(soft_limit as u64 + 1);
-                            return self
-                                .reject_codex_context_length_before_read(
-                                    method, path, headers, started, size, soft_limit,
-                                )
-                                .await;
-                        }
-                    }
                     let size = content_length(&headers).unwrap_or(limit as u64 + 1);
                     self.reject_large_body(
                         method,
@@ -759,42 +883,6 @@ impl GatewayManager {
         json_error(StatusCode::PAYLOAD_TOO_LARGE, &message)
     }
 
-    async fn reject_codex_context_length_before_read(
-        &self,
-        method: Method,
-        path: String,
-        headers: HeaderMap,
-        started: Instant,
-        size: u64,
-        limit: usize,
-    ) -> Response {
-        let respond_as_stream = accepts_event_stream(&headers);
-        let message = codex_context_limit_message(size, limit);
-        let mut log = RequestLogEntry {
-            method: method.to_string(),
-            path: format!("/v1/{path}"),
-            status: Some(if respond_as_stream {
-                StatusCode::OK.as_u16()
-            } else {
-                StatusCode::BAD_REQUEST.as_u16()
-            }),
-            latency_ms: started.elapsed().as_millis(),
-            streamed: respond_as_stream,
-            body_size_bytes: Some(size),
-            local_rejected: true,
-            error_kind: Some("context_too_large".to_string()),
-            error: Some(message.clone()),
-            ..Default::default()
-        };
-        log.streamed = respond_as_stream;
-        let _ = self.inner.storage.append_log(&log).await;
-        if respond_as_stream {
-            context_length_exceeded_sse_response(&message, size, limit)
-        } else {
-            context_length_json_error(StatusCode::BAD_REQUEST, &message)
-        }
-    }
-
     async fn proxy_request(
         &self,
         method: Method,
@@ -804,8 +892,11 @@ impl GatewayManager {
         forced_provider_id: Option<String>,
     ) -> Response {
         let started = Instant::now();
-        let model = extract_model_from_body(&body);
-        let streamed = is_stream_request(&body);
+        let mut body = body;
+        let parsed_meta = parse_request_meta(&body);
+        let model = parsed_meta.model.clone();
+        let streamed = parsed_meta.streamed;
+        let cfg = self.inner.storage.config().await;
         let mut log = RequestLogEntry {
             method: method.to_string(),
             path: format!("/v1/{path}"),
@@ -833,7 +924,6 @@ impl GatewayManager {
             eprintln!("apidev gateway auth failed id={}", log.id);
             return resp;
         }
-        let cfg = self.inner.storage.config().await;
         let subagent_kind = codex_subagent_kind(&headers);
         if let Some(limit) =
             codex_context_body_limit_bytes(cfg.gateway.codex_context_body_limit_mb, subagent_kind)
@@ -851,6 +941,30 @@ impl GatewayManager {
                     .await;
             }
         }
+        let estimated_tokens = if is_codex_context_guard_path(&path) {
+            match estimate_request_tokens_fast(log.model.as_deref(), &body).await {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    eprintln!(
+                        "apidev gateway token_count_unavailable path=/v1/{} model={:?}: {}",
+                        path, log.model, err
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        log.estimated_input_tokens = estimated_tokens;
+        if path == "responses/compact" && streamed {
+            log.status = Some(StatusCode::BAD_REQUEST.as_u16());
+            log.latency_ms = started.elapsed().as_millis();
+            log.local_rejected = true;
+            log.error_kind = Some("invalid_request".to_string());
+            log.error = Some("stream=true is not supported for /v1/responses/compact".to_string());
+            let _ = self.inner.storage.append_log(&log).await;
+            return compact_stream_not_supported_error();
+        }
         let providers = self
             .ordered_providers(
                 forced_provider_id,
@@ -858,24 +972,183 @@ impl GatewayManager {
                 cfg.routing.selected_provider_id.clone(),
             )
             .await;
-        if providers.is_empty() {
-            log.error = Some("no enabled providers".to_string());
-            log.latency_ms = started.elapsed().as_millis();
-            let _ = self.inner.storage.append_log(&log).await;
-            return json_error(StatusCode::BAD_GATEWAY, "no enabled upstream providers");
-        }
         let max_attempts = if cfg.routing.auto_failover {
             cfg.routing
                 .max_attempts_per_request
                 .max(1)
-                .min(providers.len())
+                .min(providers.len().max(1))
         } else {
             1
         };
-        let mut last_error = None;
         let auto_failover = cfg.routing.auto_failover;
+        let compact_retry_enabled = cfg.gateway.codex_compact_retry_enabled
+            && cfg.gateway.codex_compact_max_attempts > 0
+            && !path.eq("responses/compact")
+            && matches!(path.as_str(), "responses" | "chat/completions");
+        let can_retry_after_compact = compact_retry_enabled && !streamed;
+        let can_precompact_stream = compact_retry_enabled && streamed;
+        let mut force_stream_precompact = can_precompact_stream
+            && is_codex_context_guard_path(&path)
+            && body.len()
+                > codex_context_body_limit_bytes(
+                    cfg.gateway.codex_context_body_limit_mb,
+                    subagent_kind,
+                )
+                .unwrap_or(usize::MAX);
+        if let Some(limit) =
+            codex_context_body_limit_bytes(cfg.gateway.codex_context_body_limit_mb, subagent_kind)
+        {
+            if is_codex_context_guard_path(&path) && body.len() > limit {
+                if can_retry_after_compact {
+                    return match self
+                        .dispatch_compact_retry(
+                            &providers,
+                            max_attempts,
+                            &method,
+                            &path,
+                            &headers,
+                            body.clone(),
+                            &mut log,
+                            started,
+                        )
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(err) => {
+                            log.status = Some(StatusCode::BAD_REQUEST.as_u16());
+                            log.latency_ms = started.elapsed().as_millis();
+                            log.compact_error = Some(err.message.clone());
+                            log.error = Some(err.message.clone());
+                            log.error_kind = Some("context_too_large".to_string());
+                            let _ = self.inner.storage.append_log(&log).await;
+                            context_length_json_error(StatusCode::BAD_REQUEST, &err.message)
+                        }
+                    };
+                }
+                let respond_as_stream = streamed || accepts_event_stream(&headers);
+                return self
+                    .reject_codex_context_body(
+                        log,
+                        started,
+                        body.len() as u64,
+                        limit,
+                        respond_as_stream,
+                    )
+                    .await;
+            }
+        }
+        if is_codex_context_guard_path(&path)
+            && cfg.gateway.codex_context_soft_token_limit > 0
+            && estimated_tokens
+                .is_some_and(|tokens| tokens > cfg.gateway.codex_context_soft_token_limit)
+        {
+            if can_retry_after_compact {
+                return match self
+                    .dispatch_compact_retry(
+                        &providers,
+                        max_attempts,
+                        &method,
+                        &path,
+                        &headers,
+                        body.clone(),
+                        &mut log,
+                        started,
+                    )
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        log.status = Some(StatusCode::BAD_REQUEST.as_u16());
+                        log.latency_ms = started.elapsed().as_millis();
+                        log.compact_error = Some(err.message.clone());
+                        log.error = Some(err.message.clone());
+                        log.error_kind = Some("context_too_large".to_string());
+                        let _ = self.inner.storage.append_log(&log).await;
+                        context_length_json_error(StatusCode::BAD_REQUEST, &err.message)
+                    }
+                };
+            }
+            if can_precompact_stream {
+                force_stream_precompact = true;
+            } else {
+                let respond_as_stream = streamed || accepts_event_stream(&headers);
+                return self
+                    .reject_codex_context_tokens(
+                        log,
+                        started,
+                        estimated_tokens.unwrap_or_default(),
+                        cfg.gateway.codex_context_soft_token_limit,
+                        respond_as_stream,
+                    )
+                    .await;
+            }
+        }
+        if providers.is_empty() {
+            log.error = Some("no enabled upstream providers".to_string());
+            log.latency_ms = started.elapsed().as_millis();
+            log.error_kind = Some("no_provider".to_string());
+            log.status = Some(StatusCode::BAD_GATEWAY.as_u16());
+            let _ = self.inner.storage.append_log(&log).await;
+            return json_error(StatusCode::BAD_GATEWAY, "no enabled upstream providers");
+        }
+
+        if path == "responses/compact" {
+            return self
+                .handle_local_compact_endpoint(
+                    providers,
+                    max_attempts,
+                    &headers,
+                    body,
+                    log,
+                    started,
+                )
+                .await;
+        }
 
         if streamed {
+            if force_stream_precompact {
+                let provider = match providers
+                    .iter()
+                    .find(|provider| provider.capabilities.responses_api)
+                    .cloned()
+                {
+                    Some(provider) => provider,
+                    None => {
+                        log.error = Some("no enabled upstream providers".to_string());
+                        log.error_kind = Some("no_provider".to_string());
+                        log.status = Some(StatusCode::BAD_GATEWAY.as_u16());
+                        log.latency_ms = started.elapsed().as_millis();
+                        let _ = self.inner.storage.append_log(&log).await;
+                        return json_error(
+                            StatusCode::BAD_GATEWAY,
+                            "no enabled upstream providers",
+                        );
+                    }
+                };
+                match self
+                    .prepare_local_compaction(&provider, &headers, &body, &path)
+                    .await
+                {
+                    Ok(prepared) => {
+                        log.compact_attempted = true;
+                        log.compacted = true;
+                        log.compact_provider_name = Some(provider.name.clone());
+                        log.estimated_input_tokens = prepared.estimated_tokens;
+                        body = prepared.compacted_body;
+                    }
+                    Err(err) => {
+                        log.compact_attempted = true;
+                        log.compact_provider_name = Some(provider.name.clone());
+                        log.compact_error = Some(err.message.clone());
+                        log.error = Some(err.message.clone());
+                        log.error_kind = Some("context_too_large".to_string());
+                        log.status = Some(StatusCode::BAD_REQUEST.as_u16());
+                        log.latency_ms = started.elapsed().as_millis();
+                        let _ = self.inner.storage.append_log(&log).await;
+                        return context_length_json_error(StatusCode::BAD_REQUEST, &err.message);
+                    }
+                }
+            }
             return self
                 .proxy_stream_request(
                     providers,
@@ -891,7 +1164,12 @@ impl GatewayManager {
                 .await;
         }
 
-        for provider in providers.into_iter().take(max_attempts) {
+        let mut last_error = None;
+        let original_body = body.clone();
+        let request_providers: Vec<ProviderConfig> =
+            providers.into_iter().take(max_attempts).collect();
+
+        for (provider_index, provider) in request_providers.iter().cloned().enumerate() {
             log.attempts += 1;
             match self
                 .send_upstream(&provider, &method, &path, &headers, body.clone())
@@ -903,7 +1181,44 @@ impl GatewayManager {
                     log.status = attempt.status.map(|s| s.as_u16());
                     log.latency_ms = started.elapsed().as_millis();
                     log.error = attempt.error.clone();
+                    if path == "responses/compact" && attempt.status.is_some_and(|s| s.is_success())
+                    {
+                        log.compacted = true;
+                        log.compact_attempted = true;
+                        log.compact_provider_name = Some(provider.name.clone());
+                    }
                     if let Some(status) = attempt.status {
+                        if compact_retry_enabled
+                            && attempt_indicates_context_too_large(status, attempt.error.as_deref())
+                        {
+                            match self
+                                .compact_and_retry_request(
+                                    &provider,
+                                    &request_providers[provider_index..],
+                                    request_providers.len() - provider_index,
+                                    &method,
+                                    &path,
+                                    &headers,
+                                    original_body.clone(),
+                                    log.clone(),
+                                    started,
+                                )
+                                .await
+                            {
+                                Ok(response) => return response,
+                                Err(err) => {
+                                    log.compact_error = Some(err.message.clone());
+                                    log.error = Some(err.message.clone());
+                                    log.status = Some(StatusCode::BAD_REQUEST.as_u16());
+                                    log.error_kind = Some("context_too_large".to_string());
+                                    let _ = self.inner.storage.append_log(&log).await;
+                                    return context_length_json_error(
+                                        StatusCode::BAD_REQUEST,
+                                        log.error.as_deref().unwrap_or("compact retry failed"),
+                                    );
+                                }
+                            }
+                        }
                         if auto_failover && should_failover_status(status, attempt.error.as_deref())
                         {
                             let err = attempt.error.clone().unwrap_or_else(|| {
@@ -1009,6 +1324,40 @@ impl GatewayManager {
         }
     }
 
+    async fn reject_codex_context_tokens(
+        &self,
+        mut log: RequestLogEntry,
+        started: Instant,
+        tokens: i64,
+        limit: i64,
+        respond_as_stream: bool,
+    ) -> Response {
+        let message = format!(
+            "Other Model local token guard blocked an oversized Codex request: estimated {} input tokens exceed the soft limit {}. Please compact/summarize the thread context and retry.",
+            tokens, limit
+        );
+        log.status = Some(if respond_as_stream {
+            StatusCode::OK.as_u16()
+        } else {
+            StatusCode::BAD_REQUEST.as_u16()
+        });
+        log.latency_ms = started.elapsed().as_millis();
+        log.local_rejected = true;
+        log.streamed = respond_as_stream;
+        log.error_kind = Some("context_too_large".to_string());
+        log.error = Some(message.clone());
+        let _ = self.inner.storage.append_log(&log).await;
+        if respond_as_stream {
+            context_length_exceeded_sse_response(
+                &message,
+                log.body_size_bytes.unwrap_or_default(),
+                limit.max(0) as usize,
+            )
+        } else {
+            context_length_json_error(StatusCode::BAD_REQUEST, &message)
+        }
+    }
+
     async fn proxy_stream_request(
         &self,
         providers: Vec<ProviderConfig>,
@@ -1053,6 +1402,19 @@ impl GatewayManager {
                         let _ = self
                             .record_provider_failure(&provider, Some(status.as_u16()), err.clone())
                             .await;
+                        if attempt_indicates_context_too_large(status, Some(&text)) {
+                            let mut stream_log = log.clone();
+                            stream_log.provider_id = Some(provider.id.clone());
+                            stream_log.provider_name = Some(provider.name.clone());
+                            stream_log.status = Some(status.as_u16());
+                            stream_log.latency_ms = started.elapsed().as_millis();
+                            stream_log.error = Some(err);
+                            stream_log.error_kind = Some("context_too_large".to_string());
+                            let _ = self.inner.storage.append_log(&stream_log).await;
+                            let body = Bytes::from(text);
+                            let headers = sanitize_response_headers(headers, body.len());
+                            return (status, headers, body).into_response();
+                        }
                         if auto_failover && should_failover_status(status, Some(&text)) {
                             log.failover_reason = Some(err.clone());
                             last_error = Some(err);
@@ -1187,6 +1549,497 @@ impl GatewayManager {
                 error,
             })
         }
+    }
+
+    async fn dispatch_compact_retry(
+        &self,
+        providers: &[ProviderConfig],
+        max_attempts: usize,
+        method: &Method,
+        path: &str,
+        headers: &HeaderMap,
+        original_body: Bytes,
+        log: &mut RequestLogEntry,
+        started: Instant,
+    ) -> Result<Response, CompactFailure> {
+        let mut last_failure: Option<CompactFailure> = None;
+
+        for provider in providers
+            .iter()
+            .filter(|provider| provider.capabilities.responses_api)
+            .take(max_attempts)
+        {
+            log.compact_attempted = true;
+            log.compact_provider_name = Some(provider.name.clone());
+            match self
+                .compact_and_retry_request(
+                    provider,
+                    providers,
+                    max_attempts,
+                    method,
+                    path,
+                    headers,
+                    original_body.clone(),
+                    log.clone(),
+                    started,
+                )
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    log.compact_error = Some(err.message.clone());
+                    match err.kind {
+                        CompactFailureKind::Retryable => last_failure = Some(err),
+                        CompactFailureKind::Failed | CompactFailureKind::ContextTooLarge => {
+                            return Err(err)
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(last_failure.unwrap_or(CompactFailure {
+            kind: CompactFailureKind::Failed,
+            message: "no enabled upstream providers".to_string(),
+        }))
+    }
+
+    async fn compact_and_retry_request(
+        &self,
+        provider: &ProviderConfig,
+        retry_providers: &[ProviderConfig],
+        max_attempts: usize,
+        method: &Method,
+        path: &str,
+        headers: &HeaderMap,
+        original_body: Bytes,
+        mut log: RequestLogEntry,
+        started: Instant,
+    ) -> Result<Response, CompactFailure> {
+        let prepared = self
+            .prepare_local_compaction(provider, headers, &original_body, path)
+            .await?;
+        let ordered_retry_providers: Vec<ProviderConfig> = std::iter::once(provider.clone())
+            .chain(
+                retry_providers
+                    .iter()
+                    .filter(|candidate| candidate.id != provider.id)
+                    .cloned(),
+            )
+            .take(max_attempts)
+            .collect();
+        let mut last_retry_error: Option<String> = None;
+
+        for retry_provider in ordered_retry_providers {
+            let retry_body = if retry_provider.id == provider.id {
+                prepared.compacted_body.clone()
+            } else {
+                self.prepare_local_compaction(&retry_provider, headers, &original_body, path)
+                    .await?
+                    .compacted_body
+            };
+            log.attempts += 1;
+            match self
+                .send_upstream(&retry_provider, method, path, headers, retry_body.clone())
+                .await
+            {
+                Ok(retry_attempt) => {
+                    let status = retry_attempt.status.unwrap_or(StatusCode::BAD_GATEWAY);
+                    let bytes = retry_attempt.body.clone().unwrap_or_default();
+                    if !status.is_success()
+                        && attempt_indicates_context_too_large(
+                            status,
+                            retry_attempt.error.as_deref(),
+                        )
+                    {
+                        return Err(CompactFailure {
+                            kind: CompactFailureKind::ContextTooLarge,
+                            message: format!(
+                                "request still exceeds context limit after compact: {}",
+                                retry_attempt
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| format!("HTTP {}", status.as_u16()))
+                            ),
+                        });
+                    }
+                    if auto_failover_after_compact(status, retry_attempt.error.as_deref()) {
+                        let err = retry_attempt
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("upstream returned {}", status.as_u16()));
+                        let _ = self
+                            .record_provider_failure(
+                                &retry_provider,
+                                Some(status.as_u16()),
+                                err.clone(),
+                            )
+                            .await;
+                        last_retry_error = Some(err);
+                        continue;
+                    }
+
+                    log.compacted = true;
+                    log.compact_attempted = true;
+                    log.compact_provider_name = Some(retry_provider.name.clone());
+                    log.provider_id = Some(retry_provider.id.clone());
+                    log.provider_name = Some(retry_provider.name.clone());
+                    log.status = Some(status.as_u16());
+                    log.error = if status.is_success() {
+                        None
+                    } else {
+                        retry_attempt.error.clone()
+                    };
+                    log.latency_ms = started.elapsed().as_millis();
+                    log.estimated_input_tokens =
+                        estimate_request_tokens_fast(log.model.as_deref(), &retry_body)
+                            .await
+                            .ok();
+                    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+                            let _ = self
+                                .remember_response_route(id.to_string(), retry_provider.id.clone())
+                                .await;
+                        }
+                        log.usage = value.get("usage").cloned();
+                    }
+                    if status.is_success() {
+                        let _ = self
+                            .record_provider_success(
+                                &retry_provider,
+                                Some(status.as_u16()),
+                                Some(retry_attempt.latency_ms),
+                                rate_limit_hint(&retry_attempt.headers),
+                            )
+                            .await;
+                    } else {
+                        let err = retry_attempt
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("upstream returned {}", status.as_u16()));
+                        let _ = self
+                            .record_provider_failure(&retry_provider, Some(status.as_u16()), err)
+                            .await;
+                    }
+                    let headers =
+                        sanitize_response_headers(retry_attempt.headers.clone(), bytes.len());
+                    let _ = self.inner.storage.append_log(&log).await;
+                    return Ok((status, headers, bytes).into_response());
+                }
+                Err(err) => {
+                    let err_text = format!("retry after compact failed: {err}");
+                    let _ = self
+                        .record_provider_failure(&retry_provider, None, err_text.clone())
+                        .await;
+                    last_retry_error = Some(err_text);
+                    continue;
+                }
+            }
+        }
+
+        Err(CompactFailure {
+            kind: CompactFailureKind::Failed,
+            message: last_retry_error
+                .unwrap_or_else(|| "all upstream providers failed after compact".to_string()),
+        })
+    }
+
+    async fn handle_local_compact_endpoint(
+        &self,
+        providers: Vec<ProviderConfig>,
+        max_attempts: usize,
+        headers: &HeaderMap,
+        body: Bytes,
+        mut log: RequestLogEntry,
+        started: Instant,
+    ) -> Response {
+        let request_providers: Vec<ProviderConfig> = providers
+            .into_iter()
+            .filter(|provider| provider.capabilities.responses_api)
+            .take(max_attempts)
+            .collect();
+        let mut last_error = None;
+        for provider in request_providers {
+            log.attempts += 1;
+            log.compact_attempted = true;
+            log.compact_provider_name = Some(provider.name.clone());
+            match self
+                .prepare_local_compaction(&provider, headers, &body, "responses/compact")
+                .await
+            {
+                Ok(prepared) => {
+                    let response = local_compact_response(
+                        prepared.replacement.clone(),
+                        prepared.estimated_tokens,
+                    );
+                    log.compacted = true;
+                    log.provider_id = Some(provider.id.clone());
+                    log.provider_name = Some(provider.name.clone());
+                    log.status = Some(StatusCode::OK.as_u16());
+                    log.error = None;
+                    log.latency_ms = started.elapsed().as_millis();
+                    log.estimated_input_tokens = prepared.estimated_tokens;
+                    let _ = self.inner.storage.append_log(&log).await;
+                    return response;
+                }
+                Err(err) => {
+                    log.compact_error = Some(err.message.clone());
+                    last_error = Some(err.message);
+                    continue;
+                }
+            }
+        }
+
+        log.error = Some(last_error.unwrap_or_else(|| "no enabled upstream providers".to_string()));
+        log.error_kind = Some("context_too_large".to_string());
+        log.status = Some(StatusCode::BAD_REQUEST.as_u16());
+        log.latency_ms = started.elapsed().as_millis();
+        let _ = self.inner.storage.append_log(&log).await;
+        context_length_json_error(
+            StatusCode::BAD_REQUEST,
+            log.error.as_deref().unwrap_or("local compact failed"),
+        )
+    }
+
+    async fn prepare_local_compaction(
+        &self,
+        provider: &ProviderConfig,
+        headers: &HeaderMap,
+        original_body: &Bytes,
+        path: &str,
+    ) -> Result<PreparedCompaction, CompactFailure> {
+        let ParsedCompactionRequest {
+            mut value,
+            model,
+            target,
+            original_context,
+        } = parse_compaction_request(original_body, path)?;
+        let replacement = self
+            .build_local_compacted_payload(
+                provider,
+                headers,
+                model.as_deref(),
+                target,
+                &original_context,
+            )
+            .await?;
+        match target {
+            CompactTargetField::Input => value["input"] = replacement.clone(),
+            CompactTargetField::Messages => value["messages"] = replacement.clone(),
+        }
+        if value.get("stream").is_some() {
+            value["stream"] = Value::Bool(false);
+        }
+        let estimated_tokens = estimate_value_tokens_fast(model.as_deref(), value.clone())
+            .await
+            .ok();
+        if estimated_tokens.is_some_and(|tokens| tokens > LOCAL_COMPACT_RETRY_TARGET_TOKENS) {
+            let transcript =
+                items_to_transcript_fast(context_items_for_target(target, &original_context))
+                    .await?;
+            let fallback_summary = self
+                .summarize_transcript_recursive(provider, headers, model.as_deref(), transcript, 0)
+                .await?;
+            let fallback_replacement = rebuild_context_value(
+                target,
+                vec![summary_item_for_target(target, fallback_summary)],
+            );
+            match target {
+                CompactTargetField::Input => value["input"] = fallback_replacement.clone(),
+                CompactTargetField::Messages => value["messages"] = fallback_replacement.clone(),
+            }
+            let estimated_tokens = estimate_value_tokens_fast(model.as_deref(), value.clone())
+                .await
+                .ok();
+            if estimated_tokens.is_some_and(|tokens| tokens > LOCAL_COMPACT_RETRY_TARGET_TOKENS) {
+                return Err(CompactFailure {
+                    kind: CompactFailureKind::ContextTooLarge,
+                    message: format!(
+                        "local compact still could not shrink request below retry target: estimated {} tokens remain after 3 rounds",
+                        estimated_tokens.unwrap_or_default()
+                    ),
+                });
+            }
+            let compacted_body =
+                serde_json::to_vec(&value)
+                    .map(Bytes::from)
+                    .map_err(|err| CompactFailure {
+                        kind: CompactFailureKind::Failed,
+                        message: format!("serialize compacted request failed: {err}"),
+                    })?;
+            return Ok(PreparedCompaction {
+                replacement: fallback_replacement,
+                compacted_body,
+                estimated_tokens,
+            });
+        }
+        let compacted_body =
+            serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .map_err(|err| CompactFailure {
+                    kind: CompactFailureKind::Failed,
+                    message: format!("serialize compacted request failed: {err}"),
+                })?;
+        Ok(PreparedCompaction {
+            replacement,
+            compacted_body,
+            estimated_tokens,
+        })
+    }
+
+    async fn build_local_compacted_payload(
+        &self,
+        provider: &ProviderConfig,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        target: CompactTargetField,
+        original_context: &Value,
+    ) -> Result<Value, CompactFailure> {
+        let items = context_items_for_target(target, original_context);
+        if items.len() <= LOCAL_COMPACT_PRESERVE_RECENT_TURNS {
+            return Ok(original_context.clone());
+        }
+        let CompactionItemPlan {
+            stable_items,
+            old_items,
+            recent_items,
+        } = build_compaction_item_plan(model, items).await?;
+        if old_items.is_empty() {
+            let mut combined = stable_items;
+            combined.extend(recent_items);
+            return Ok(rebuild_context_value(target, combined));
+        }
+        let transcript = items_to_transcript_fast(old_items).await?;
+        let summary = self
+            .summarize_transcript_recursive(provider, headers, model, transcript, 0)
+            .await?;
+        let summary_item = summary_item_for_target(target, summary);
+        let mut combined = stable_items;
+        combined.push(summary_item);
+        combined.extend(recent_items);
+        Ok(rebuild_context_value(target, combined))
+    }
+
+    async fn summarize_transcript_recursive(
+        &self,
+        provider: &ProviderConfig,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        transcript: String,
+        round: usize,
+    ) -> Result<String, CompactFailure> {
+        let mut current = transcript;
+        let mut current_round = round;
+        loop {
+            let estimated = estimate_text_tokens_fast(model, current.clone()).await?;
+            if estimated <= LOCAL_COMPACT_FINAL_SUMMARY_TARGET
+                || current_round >= LOCAL_COMPACT_MAX_ROUNDS
+            {
+                return self
+                    .summarize_transcript_once(
+                        provider,
+                        headers,
+                        model,
+                        &current,
+                        LOCAL_COMPACT_FINAL_SUMMARY_TARGET,
+                        current_round,
+                    )
+                    .await;
+            }
+
+            let chunks = split_text_by_token_budget_fast(
+                model,
+                current.clone(),
+                LOCAL_COMPACT_CHUNK_TOKEN_LIMIT,
+            )
+            .await?;
+            let mut partials = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                partials.push(
+                    self.summarize_transcript_once(
+                        provider,
+                        headers,
+                        model,
+                        &chunk,
+                        LOCAL_COMPACT_CHUNK_SUMMARY_TARGET,
+                        current_round,
+                    )
+                    .await?,
+                );
+            }
+            current = partials
+                .into_iter()
+                .enumerate()
+                .map(|(idx, part)| format!("### Chunk {}\n{}", idx + 1, part))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            current_round += 1;
+        }
+    }
+
+    async fn summarize_transcript_once(
+        &self,
+        provider: &ProviderConfig,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        transcript: &str,
+        target_tokens: i64,
+        round: usize,
+    ) -> Result<String, CompactFailure> {
+        let model_name = model
+            .map(str::to_string)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "gpt-5.5".to_string());
+        let prompt = local_compact_summary_prompt(transcript, target_tokens, round);
+        let request_body = json!({
+            "model": model_name,
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": prompt
+                }]
+            }],
+            "stream": false,
+            "max_output_tokens": target_tokens.min(4096).max(512),
+        });
+        let request_body = serde_json::to_vec(&request_body)
+            .map(Bytes::from)
+            .map_err(|err| CompactFailure {
+                kind: CompactFailureKind::Failed,
+                message: format!("serialize local compact summary request failed: {err}"),
+            })?;
+        let attempt = self
+            .send_upstream(provider, &Method::POST, "responses", headers, request_body)
+            .await
+            .map_err(|err| CompactFailure {
+                kind: CompactFailureKind::Retryable,
+                message: format!("local compact summary request failed: {err}"),
+            })?;
+        let status = attempt.status.unwrap_or(StatusCode::BAD_GATEWAY);
+        let bytes = attempt.body.unwrap_or_default();
+        if !status.is_success() {
+            let preview = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(700)
+                .collect::<String>();
+            return Err(CompactFailure {
+                kind: if auto_failover_after_compact(status, Some(&preview)) {
+                    CompactFailureKind::Retryable
+                } else {
+                    CompactFailureKind::Failed
+                },
+                message: format!(
+                    "local compact summary upstream returned {}: {}",
+                    status.as_u16(),
+                    preview
+                ),
+            });
+        }
+        extract_text_from_response_body(&bytes).ok_or_else(|| CompactFailure {
+            kind: CompactFailureKind::Failed,
+            message: "local compact summary response did not contain output text".to_string(),
+        })
     }
 
     async fn stream_opened_upstream(
@@ -1521,6 +2374,91 @@ async fn get_model_handler(
     )
 }
 
+fn attempt_indicates_context_too_large(status: StatusCode, body_preview: Option<&str>) -> bool {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        return true;
+    }
+    let body = body_preview.unwrap_or_default().to_ascii_lowercase();
+    status == StatusCode::BAD_REQUEST
+        && (body.contains("context_length_exceeded")
+            || body.contains("context_too_large")
+            || body.contains("context length")
+            || body.contains("too many tokens")
+            || body.contains("maximum context"))
+}
+
+fn attempt_indicates_compact_not_supported(status: StatusCode, body_preview: Option<&str>) -> bool {
+    let body = body_preview.unwrap_or_default().to_ascii_lowercase();
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST
+            | StatusCode::NOT_FOUND
+            | StatusCode::NOT_IMPLEMENTED
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+    ) && (body.contains("openai-compact")
+        || body.contains("responses/compact")
+        || body.contains("compact_not_supported")
+        || body.contains("model_not_found")
+        || (body.contains("compact") && body.contains("not support"))
+        || (body.contains("compact") && body.contains("unsupported"))
+        || (body.contains("compact") && body.contains("does not exist"))
+        || (body.contains("compact") && body.contains("not found"))
+        || (body.contains("compact") && body.contains("no available channel")))
+}
+
+fn should_fallback_model_discovery_to_responses(status: StatusCode, body_preview: &str) -> bool {
+    let body = body_preview.to_ascii_lowercase();
+    matches!(
+        status,
+        StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::NOT_IMPLEMENTED
+            | StatusCode::BAD_REQUEST
+    ) && (body.contains("not found")
+        || body.contains("unsupported")
+        || body.contains("not support")
+        || body.contains("unknown endpoint")
+        || body.contains("no route")
+        || body.contains("no such"))
+}
+
+fn compact_stream_not_supported_error() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "message": "stream=true is not supported for /v1/responses/compact",
+                "type": "invalid_request_error",
+                "code": "invalid_request_error"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn local_compact_response(output: Value, estimated_tokens: Option<i64>) -> Response {
+    Json(json!({
+        "id": format!("resp_local_compact_{}", uuid::Uuid::new_v4().simple()),
+        "object": "response",
+        "status": "completed",
+        "output": output,
+        "metadata": {
+            "gateway": "other_model",
+            "local_compaction": true,
+            "estimated_input_tokens": estimated_tokens,
+        }
+    }))
+    .into_response()
+}
+
+async fn compact_handler(State(state): State<GatewayAppState>, request: Request<Body>) -> Response {
+    state
+        .manager
+        .proxy_http_request(Method::POST, "responses/compact".to_string(), request, None)
+        .await
+}
+
 async fn responses_handler(
     State(state): State<GatewayAppState>,
     request: Request<Body>,
@@ -1585,8 +2523,14 @@ fn should_failover_status(status: StatusCode, body_preview: Option<&str>) -> boo
             | ErrorKind::Upstream5xx
             | ErrorKind::Network
     ) || status == StatusCode::PAYLOAD_TOO_LARGE
+        || attempt_indicates_compact_not_supported(status, body_preview)
         || (matches!(status, StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST)
             && looks_like_model_routing_error(body))
+}
+
+fn auto_failover_after_compact(status: StatusCode, body_preview: Option<&str>) -> bool {
+    should_failover_status(status, body_preview)
+        && !attempt_indicates_context_too_large(status, body_preview)
 }
 
 fn looks_like_model_routing_error(text: &str) -> bool {
@@ -1862,6 +2806,57 @@ fn is_stream_request(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_request_meta(body: &[u8]) -> ParsedRequestMeta {
+    let value = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        Err(_) => return ParsedRequestMeta::default(),
+    };
+    ParsedRequestMeta {
+        model: value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        streamed: value
+            .get("stream")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false),
+    }
+}
+
+fn parse_compaction_request(
+    body: &[u8],
+    path: &str,
+) -> Result<ParsedCompactionRequest, CompactFailure> {
+    let value: Value = serde_json::from_slice(body).map_err(|err| CompactFailure {
+        kind: CompactFailureKind::Failed,
+        message: format!("parse request for local compact failed: {err}"),
+    })?;
+    let model = value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let target = compact_target_field(path, &value).ok_or_else(|| CompactFailure {
+        kind: CompactFailureKind::Failed,
+        message: "request does not contain compactable input/messages".to_string(),
+    })?;
+    let original_context = match target {
+        CompactTargetField::Input => value
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new())),
+        CompactTargetField::Messages => value
+            .get("messages")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    };
+    Ok(ParsedCompactionRequest {
+        value,
+        model,
+        target,
+        original_context,
+    })
+}
+
 fn apply_provider_headers(
     mut req: reqwest::RequestBuilder,
     provider: &ProviderConfig,
@@ -2015,6 +3010,348 @@ fn compact_json(value: &Value) -> String {
     value.to_string().chars().take(700).collect()
 }
 
+fn compact_target_field(path: &str, value: &Value) -> Option<CompactTargetField> {
+    if value.get("messages").is_some() || path == "chat/completions" {
+        Some(CompactTargetField::Messages)
+    } else if value.get("input").is_some() || path == "responses" || path == "responses/compact" {
+        Some(CompactTargetField::Input)
+    } else {
+        None
+    }
+}
+
+fn context_items_for_target(target: CompactTargetField, value: &Value) -> Vec<Value> {
+    match target {
+        CompactTargetField::Input => match value {
+            Value::Array(items) => items.clone(),
+            Value::Null => Vec::new(),
+            other => vec![other.clone()],
+        },
+        CompactTargetField::Messages => match value {
+            Value::Array(items) => items.clone(),
+            Value::Null => Vec::new(),
+            other => vec![json!({"role":"user","content": stringify_non_text_value(other)})],
+        },
+    }
+}
+
+fn rebuild_context_value(target: CompactTargetField, items: Vec<Value>) -> Value {
+    match target {
+        CompactTargetField::Input | CompactTargetField::Messages => Value::Array(items),
+    }
+}
+
+fn preserved_recent_start(model: Option<&str>, items: &[Value]) -> usize {
+    if items.len() <= LOCAL_COMPACT_PRESERVE_RECENT_TURNS {
+        return 0;
+    }
+    let mut idx = items
+        .len()
+        .saturating_sub(LOCAL_COMPACT_PRESERVE_RECENT_TURNS);
+    let mut token_total = 0_i64;
+    for current in (0..items.len()).rev() {
+        token_total += estimate_value_tokens(model, &items[current])
+            .unwrap_or_else(|_| estimate_text_tokens(model, &compact_json(&items[current])));
+        idx = current;
+        if items.len().saturating_sub(current) >= LOCAL_COMPACT_PRESERVE_RECENT_TURNS
+            && token_total >= LOCAL_COMPACT_PRESERVE_RECENT_TOKEN_WINDOW
+        {
+            break;
+        }
+    }
+    idx.min(items.len())
+}
+
+fn stable_prefix_len(items: &[Value]) -> usize {
+    let mut len = 0usize;
+    for item in items {
+        let Some(role) = item.get("role").and_then(Value::as_str) else {
+            break;
+        };
+        if matches!(role, "system" | "developer") {
+            len += 1;
+        } else {
+            break;
+        }
+    }
+    len
+}
+
+fn summary_item_for_target(target: CompactTargetField, summary: String) -> Value {
+    match target {
+        CompactTargetField::Input => json!({
+            "role": "system",
+            "content": [{
+                "type": "input_text",
+                "text": format!("Earlier conversation summary:\n{}", summary)
+            }]
+        }),
+        CompactTargetField::Messages => json!({
+            "role": "system",
+            "content": format!("Earlier conversation summary:\n{}", summary)
+        }),
+    }
+}
+
+fn items_to_transcript(items: &[Value]) -> String {
+    items
+        .iter()
+        .map(item_to_transcript_line)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn item_to_transcript_line(item: &Value) -> String {
+    match item {
+        Value::Object(map) => {
+            let role = map
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_ascii_uppercase();
+            let content = map
+                .get("content")
+                .map(compact_content_value)
+                .unwrap_or_else(|| compact_content_value(item));
+            if let Some(name) = map.get("name").and_then(Value::as_str) {
+                format!("{role} ({name}): {content}")
+            } else {
+                format!("{role}: {content}")
+            }
+        }
+        other => format!("ITEM: {}", compact_content_value(other)),
+    }
+}
+
+async fn estimate_request_tokens_fast(model: Option<&str>, body: &[u8]) -> Result<i64> {
+    let owned = body.to_vec();
+    let model = model.map(str::to_string);
+    tokio::task::spawn_blocking(move || estimate_request_tokens(model.as_deref(), &owned))
+        .await
+        .map_err(|err| anyhow!("token count task join failed: {err}"))?
+}
+
+async fn estimate_value_tokens_fast(model: Option<&str>, value: Value) -> Result<i64> {
+    let model = model.map(str::to_string);
+    tokio::task::spawn_blocking(move || estimate_value_tokens(model.as_deref(), &value))
+        .await
+        .map_err(|err| anyhow!("token count task join failed: {err}"))?
+}
+
+async fn items_to_transcript_fast(items: Vec<Value>) -> Result<String, CompactFailure> {
+    tokio::task::spawn_blocking(move || items_to_transcript(&items))
+        .await
+        .map_err(|err| CompactFailure {
+            kind: CompactFailureKind::Failed,
+            message: format!("local compact transcript task join failed: {err}"),
+        })
+}
+
+async fn build_compaction_item_plan(
+    model: Option<&str>,
+    items: Vec<Value>,
+) -> Result<CompactionItemPlan, CompactFailure> {
+    let model = model.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let stable_prefix = stable_prefix_len(&items);
+        let preserve_start = preserved_recent_start(model.as_deref(), &items).max(stable_prefix);
+        Ok::<CompactionItemPlan, CompactFailure>(CompactionItemPlan {
+            stable_items: items[..stable_prefix].to_vec(),
+            old_items: items[stable_prefix..preserve_start].to_vec(),
+            recent_items: items[preserve_start..].to_vec(),
+        })
+    })
+    .await
+    .map_err(|err| CompactFailure {
+        kind: CompactFailureKind::Failed,
+        message: format!("local compact item planning task join failed: {err}"),
+    })?
+}
+
+fn compact_content_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(compact_content_value)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                return text.to_string();
+            }
+            if let Some(kind) = map.get("type").and_then(Value::as_str) {
+                return match kind {
+                    "input_text" | "output_text" => map
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    "input_image" | "image" => "[image omitted]".to_string(),
+                    "input_file" | "file" => "[file omitted]".to_string(),
+                    "tool_result" | "function_call_output" => {
+                        let tool_name = map
+                            .get("tool_name")
+                            .or_else(|| map.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
+                        let payload = map
+                            .get("content")
+                            .or_else(|| map.get("output"))
+                            .map(compact_content_value)
+                            .unwrap_or_else(|| stringify_non_text_value(value));
+                        format!("[tool_result:{tool_name}] {payload}")
+                    }
+                    "function_call" => {
+                        let name = map.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let args = map
+                            .get("arguments")
+                            .map(stringify_non_text_value)
+                            .unwrap_or_default();
+                        format!("[tool_call:{name}] {args}")
+                    }
+                    _ => stringify_non_text_value(value),
+                };
+            }
+            if map.contains_key("content") {
+                return map
+                    .get("content")
+                    .map(compact_content_value)
+                    .unwrap_or_else(String::new);
+            }
+            stringify_non_text_value(value)
+        }
+        other => stringify_non_text_value(other),
+    }
+}
+
+fn stringify_non_text_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::Null => String::new(),
+        _ => value.to_string().chars().take(1200).collect(),
+    }
+}
+
+fn estimate_text_tokens(model: Option<&str>, text: &str) -> i64 {
+    estimate_value_tokens(model, &Value::String(text.to_string()))
+        .unwrap_or_else(|_| ((text.len() / 4).max(1)) as i64)
+}
+
+async fn estimate_text_tokens_fast(
+    model: Option<&str>,
+    text: String,
+) -> Result<i64, CompactFailure> {
+    let model = model.map(str::to_string);
+    tokio::task::spawn_blocking(move || estimate_text_tokens(model.as_deref(), &text))
+        .await
+        .map_err(|err| CompactFailure {
+            kind: CompactFailureKind::Failed,
+            message: format!("local compact token estimate task join failed: {err}"),
+        })
+}
+
+fn split_text_by_token_budget(model: Option<&str>, text: &str, target_tokens: i64) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_tokens = 0_i64;
+    for line in text.lines() {
+        let line_with_nl = if current.is_empty() {
+            line.to_string()
+        } else {
+            format!("\n{line}")
+        };
+        let line_tokens = estimate_text_tokens(model, &line_with_nl);
+        if !current.is_empty() && current_tokens + line_tokens > target_tokens {
+            chunks.push(current);
+            current = line.to_string();
+            current_tokens = estimate_text_tokens(model, &current);
+        } else {
+            current.push_str(&line_with_nl);
+            current_tokens += line_tokens;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+    chunks
+}
+
+async fn split_text_by_token_budget_fast(
+    model: Option<&str>,
+    text: String,
+    target_tokens: i64,
+) -> Result<Vec<String>, CompactFailure> {
+    let model = model.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        split_text_by_token_budget(model.as_deref(), &text, target_tokens)
+    })
+    .await
+    .map_err(|err| CompactFailure {
+        kind: CompactFailureKind::Failed,
+        message: format!("local compact chunk split task join failed: {err}"),
+    })
+}
+
+fn local_compact_summary_prompt(transcript: &str, target_tokens: i64, round: usize) -> String {
+    format!(
+        "Summarize the older conversation and tool history for context compaction. \
+Keep durable requirements, system/developer constraints, user goals, unresolved tasks, tool findings, errors, and decisions. \
+Remove repetition and verbose raw payloads. Output plain text only. Target about {target_tokens} tokens. Round {}.\n\nTranscript:\n{}",
+        round + 1,
+        transcript
+    )
+}
+
+fn extract_text_from_response_body(bytes: &Bytes) -> Option<String> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    extract_text_from_response_value(&value)
+}
+
+fn extract_text_from_response_value(value: &Value) -> Option<String> {
+    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    if let Some(items) = value.get("output").and_then(Value::as_array) {
+        let mut parts = Vec::new();
+        for item in items {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(text.to_string());
+                continue;
+            }
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for piece in content {
+                    if let Some(text) = piece.get("text").and_then(Value::as_str) {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return Some(parts.join("\n"));
+        }
+    }
+    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        let mut parts = Vec::new();
+        for choice in choices {
+            if let Some(text) = choice.pointer("/message/content").and_then(Value::as_str) {
+                parts.push(text.to_string());
+            }
+        }
+        if !parts.is_empty() {
+            return Some(parts.join("\n"));
+        }
+    }
+    None
+}
+
 fn rate_limit_hint(headers: &HeaderMap) -> Option<String> {
     for key in [
         "x-ratelimit-remaining-requests",
@@ -2121,10 +3458,45 @@ mod tests {
         storage::Storage,
     };
     use http::header::AUTHORIZATION;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc,
+    };
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
     };
+
+    fn json_response(status: u16, body: Value) -> ResponseTemplate {
+        ResponseTemplate::new(status).set_body_raw(body.to_string(), "application/json")
+    }
+
+    #[derive(Clone)]
+    struct SequenceResponder {
+        templates: Vec<ResponseTemplate>,
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl SequenceResponder {
+        fn new(templates: Vec<ResponseTemplate>) -> Self {
+            Self {
+                templates,
+                counter: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl wiremock::Respond for SequenceResponder {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let index = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+            self.templates.get(index).cloned().unwrap_or_else(|| {
+                self.templates
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| ResponseTemplate::new(500))
+            })
+        }
+    }
 
     #[test]
     fn joins_urls_safely() {
@@ -2162,6 +3534,356 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(123_456)
         );
+    }
+
+    #[tokio::test]
+    async fn compact_endpoint_rejects_stream_requests() {
+        let upstream_a = upstream_json(200, json!({"id": "resp_a", "object": "response"})).await;
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(&upstream_a, &upstream_b, RoutingConfig::default()).await;
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses/compact".to_string(),
+                auth_headers(),
+                Bytes::from_static(br#"{"model":"gpt-5.5","input":"ping","stream":true}"#),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("stream=true"));
+        assert_eq!(request_count(&upstream_a).await, 0);
+        assert_eq!(request_count(&upstream_b).await, 0);
+    }
+
+    #[tokio::test]
+    async fn compact_endpoint_is_local_even_when_all_providers_disable_legacy_compact_flag() {
+        let upstream_a = upstream_json(200, json!({"id": "resp_a", "object": "response"})).await;
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(&upstream_a, &upstream_b, RoutingConfig::default()).await;
+        manager
+            .inner
+            .storage
+            .update_config(|cfg| {
+                for provider in &mut cfg.providers {
+                    provider.capabilities.responses_compact = false;
+                }
+            })
+            .await
+            .unwrap();
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses/compact".to_string(),
+                auth_headers(),
+                Bytes::from_static(br#"{"model":"gpt-5.5","input":"ping"}"#),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("\"local_compaction\":true"));
+        assert_eq!(request_count(&upstream_a).await, 0);
+        assert_eq!(request_count(&upstream_b).await, 0);
+    }
+
+    #[tokio::test]
+    async fn compact_endpoint_uses_local_compaction_without_upstream_compact_route() {
+        let upstream_a = upstream_json(
+            200,
+            json!({
+                "id": "sum_a",
+                "object": "response",
+                "output": [{"type":"output_text","text":"summary from provider a"}]
+            }),
+        )
+        .await;
+
+        let upstream_b = upstream_json(
+            200,
+            json!({
+                "id": "sum_b",
+                "object": "response",
+                "output": [{"type":"output_text","text":"summary from provider b"}]
+            }),
+        )
+        .await;
+
+        let manager = test_manager(
+            &upstream_a,
+            &upstream_b,
+            RoutingConfig {
+                auto_round_robin: false,
+                auto_failover: true,
+                max_attempts_per_request: 2,
+                cooldown_secs: 60,
+                auth_failure_threshold: 2,
+                probe_interval_secs: 300,
+                max_cooldown_secs: 600,
+                selected_provider_id: None,
+            },
+        )
+        .await;
+        manager
+            .inner
+            .storage
+            .update_config(|cfg| {
+                cfg.providers[0].capabilities.responses_compact = false;
+                cfg.providers[1].capabilities.responses_compact = true;
+            })
+            .await
+            .unwrap();
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses/compact".to_string(),
+                auth_headers(),
+                Bytes::from(format!(r#"{{"model":"gpt-5.5","input":[{{"role":"system","content":[{{"type":"input_text","text":"keep this"}}]}},{{"role":"user","content":[{{"type":"input_text","text":"{}"}}]}},{{"role":"assistant","content":[{{"type":"output_text","text":"{}"}}]}},{{"role":"user","content":[{{"type":"input_text","text":"{}"}}]}},{{"role":"assistant","content":[{{"type":"output_text","text":"ok"}}]}},{{"role":"user","content":[{{"type":"input_text","text":"tail"}}]}}]}}"#, "a ".repeat(22000), "b ".repeat(22000), "c ".repeat(22000))),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("\"local_compaction\":true"));
+        assert!(request_count(&upstream_a).await >= 1);
+        assert_eq!(request_count(&upstream_b).await, 0);
+    }
+
+    #[tokio::test]
+    async fn compact_endpoint_returns_real_failure_when_local_summary_upstream_fails() {
+        let upstream_a = upstream_json(
+            503,
+            json!({"error": {"message": "summary upstream unavailable"}}),
+        )
+        .await;
+        let upstream_b = upstream_json(
+            503,
+            json!({"error": {"message": "summary upstream unavailable"}}),
+        )
+        .await;
+        let manager = test_manager(&upstream_a, &upstream_b, RoutingConfig::default()).await;
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses/compact".to_string(),
+                auth_headers(),
+                Bytes::from(format!(r#"{{"model":"gpt-5.5","input":[{{"role":"system","content":[{{"type":"input_text","text":"keep this"}}]}},{{"role":"user","content":[{{"type":"input_text","text":"{}"}}]}},{{"role":"assistant","content":[{{"type":"output_text","text":"{}"}}]}},{{"role":"user","content":[{{"type":"input_text","text":"{}"}}]}},{{"role":"assistant","content":[{{"type":"output_text","text":"{}"}}]}},{{"role":"user","content":[{{"type":"input_text","text":"tail"}}]}}]}}"#, "a ".repeat(30000), "b ".repeat(30000), "c ".repeat(30000), "d ".repeat(30000))),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("summary upstream unavailable"));
+        let logs = manager.inner.storage.read_logs(10).await.unwrap();
+        let entry = logs.last().unwrap();
+        assert_eq!(entry.error_kind.as_deref(), Some("context_too_large"));
+    }
+
+    #[tokio::test]
+    async fn auto_compact_retries_responses_after_upstream_context_error() {
+        let upstream_a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(SequenceResponder::new(vec![
+                json_response(
+                    400,
+                    json!({"error": {"message": "context_length_exceeded", "type": "invalid_request_error"}}),
+                ),
+                json_response(200, json!({"id": "resp_after_compact", "object": "response"})),
+            ]))
+            .mount(&upstream_a)
+            .await;
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(&upstream_a, &upstream_b, RoutingConfig::default()).await;
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                auth_headers(),
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.5","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_count(&upstream_a).await, 2);
+
+        let logs = manager.inner.storage.read_logs(10).await.unwrap();
+        let entry = logs.last().unwrap();
+        assert!(entry.compact_attempted);
+        assert!(entry.compacted);
+        assert_eq!(entry.compact_provider_name.as_deref(), Some("A"));
+    }
+
+    #[tokio::test]
+    async fn auto_compact_can_failover_after_compact_success() {
+        let upstream_a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(SequenceResponder::new(vec![
+                json_response(
+                    400,
+                    json!({"error": {"message": "context_length_exceeded", "type": "invalid_request_error"}}),
+                ),
+                json_response(
+                    500,
+                    json!({"error": {"message": "boom after compact"}}),
+                ),
+            ]))
+            .mount(&upstream_a)
+            .await;
+        let upstream_b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(json_response(
+                200,
+                json!({"id": "resp_from_b", "object": "response"}),
+            ))
+            .mount(&upstream_b)
+            .await;
+
+        let manager = test_manager(&upstream_a, &upstream_b, RoutingConfig::default()).await;
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                auth_headers(),
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.5","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_count(&upstream_a).await, 2);
+        assert_eq!(request_count(&upstream_b).await, 1);
+        let logs = manager.inner.storage.read_logs(10).await.unwrap();
+        let entry = logs.last().unwrap();
+        assert!(entry.compacted);
+        assert_eq!(entry.provider_name.as_deref(), Some("B"));
+        assert_eq!(entry.compact_provider_name.as_deref(), Some("B"));
+    }
+
+    #[tokio::test]
+    async fn auto_compact_retries_chat_completions_after_upstream_context_error() {
+        let upstream_a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(SequenceResponder::new(vec![
+                json_response(
+                    400,
+                    json!({"error": {"message": "maximum context length exceeded", "type": "invalid_request_error"}}),
+                ),
+                json_response(
+                    200,
+                    json!({
+                        "id": "chat_after_compact",
+                        "object": "chat.completion",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
+                    }),
+                ),
+            ]))
+            .mount(&upstream_a)
+            .await;
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(&upstream_a, &upstream_b, RoutingConfig::default()).await;
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "chat/completions".to_string(),
+                auth_headers(),
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}"#,
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_count(&upstream_a).await, 2);
+    }
+
+    #[tokio::test]
+    async fn token_soft_limit_rejects_locally_and_records_estimate() {
+        let upstream_a = upstream_json(200, json!({"id": "resp_a", "object": "response"})).await;
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(&upstream_a, &upstream_b, RoutingConfig::default()).await;
+        manager
+            .inner
+            .storage
+            .update_config(|cfg| {
+                cfg.gateway.codex_context_soft_token_limit = 1;
+                cfg.gateway.codex_compact_retry_enabled = false;
+            })
+            .await
+            .unwrap();
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                auth_headers(),
+                Bytes::from_static(br#"{"model":"gpt-5.5","input":"hello world"}"#),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let logs = manager.inner.storage.read_logs(10).await.unwrap();
+        let entry = logs.last().unwrap();
+        assert!(entry.local_rejected);
+        assert_eq!(entry.error_kind.as_deref(), Some("context_too_large"));
+        assert!(entry.estimated_input_tokens.unwrap_or_default() > 0);
+        assert_eq!(request_count(&upstream_a).await, 0);
+        assert_eq!(request_count(&upstream_b).await, 0);
+    }
+
+    #[tokio::test]
+    async fn token_soft_limit_can_trigger_local_auto_compact() {
+        let upstream_a = upstream_json(
+            200,
+            json!({"id": "resp_local_compacted", "object": "response"}),
+        )
+        .await;
+        let upstream_b = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(&upstream_a, &upstream_b, RoutingConfig::default()).await;
+        manager
+            .inner
+            .storage
+            .update_config(|cfg| {
+                cfg.gateway.codex_context_soft_token_limit = 1;
+                cfg.gateway.codex_compact_retry_enabled = true;
+            })
+            .await
+            .unwrap();
+
+        let response = manager
+            .proxy_request(
+                Method::POST,
+                "responses".to_string(),
+                auth_headers(),
+                Bytes::from_static(br#"{"model":"gpt-5.5","input":"hello world"}"#),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_count(&upstream_a).await, 1);
+        let logs = manager.inner.storage.read_logs(10).await.unwrap();
+        let entry = logs.last().unwrap();
+        assert!(entry.compact_attempted);
+        assert!(entry.compacted);
+        assert_eq!(entry.compact_provider_name.as_deref(), Some("A"));
     }
 
     #[tokio::test]
@@ -2396,6 +4118,15 @@ mod tests {
             },
         )
         .await;
+        manager
+            .inner
+            .storage
+            .update_config(|cfg| {
+                cfg.providers[0].capabilities.responses_compact = false;
+                cfg.gateway.codex_compact_retry_enabled = false;
+            })
+            .await
+            .unwrap();
         let response = manager
             .proxy_request(
                 Method::POST,
@@ -2476,6 +4207,96 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(request_count(&model_missing).await, 1);
         assert_eq!(request_count(&healthy).await, 1);
+    }
+
+    #[tokio::test]
+    async fn discover_models_falls_back_to_responses_probe_when_models_endpoint_missing() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not found"})))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value =
+                    serde_json::from_slice(&request.body).unwrap_or_else(|_| json!({}));
+                let model = body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if model == "gpt-5.4" || model == "gpt-5.5" {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"id": format!("resp_{model}"), "object": "response"}))
+                } else {
+                    ResponseTemplate::new(400)
+                        .set_body_json(json!({"error": {"message": "model not supported"}}))
+                }
+            })
+            .mount(&upstream)
+            .await;
+
+        let backup = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(&upstream, &backup, RoutingConfig::default()).await;
+        manager
+            .inner
+            .storage
+            .update_config(|cfg| {
+                cfg.providers.truncate(1);
+            })
+            .await
+            .unwrap();
+
+        let cache = manager.discover_models().await.unwrap();
+        let models = &cache.providers["a"].models;
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|m| m.id == "gpt-5.4"));
+        assert!(models.iter().any(|m| m.id == "gpt-5.5"));
+    }
+
+    #[tokio::test]
+    async fn auth_probe_falls_back_to_responses_probe_when_models_endpoint_missing() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "not found"})))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "resp_probe", "object": "response"})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let backup = upstream_json(200, json!({"id": "resp_b", "object": "response"})).await;
+        let manager = test_manager(&upstream, &backup, RoutingConfig::default()).await;
+        manager
+            .inner
+            .storage
+            .update_runtime_state(|state| {
+                state.providers.insert(
+                    "a".to_string(),
+                    ProviderState {
+                        provider_id: "a".to_string(),
+                        health: ProviderHealth::AuthFailed,
+                        next_probe_at: Some(Utc::now()),
+                        error_kind: Some(ErrorKind::AuthFailed.as_str().to_string()),
+                        ..Default::default()
+                    },
+                );
+            })
+            .await
+            .unwrap();
+
+        manager.probe_due_auth_failed_providers().await;
+
+        let runtime = manager.inner.storage.runtime_state().await;
+        let state = runtime.providers.get("a").unwrap();
+        assert_eq!(state.health, ProviderHealth::Healthy);
     }
 
     #[tokio::test]
@@ -2753,6 +4574,8 @@ mod tests {
             .update_config(|cfg| {
                 cfg.gateway.require_local_token = false;
                 cfg.gateway.max_request_body_mb = 16;
+                cfg.gateway.codex_context_soft_token_limit = 0;
+                cfg.gateway.codex_context_body_limit_mb = 0;
             })
             .await
             .unwrap();
@@ -2924,7 +4747,10 @@ mod tests {
             stream_idle_timeout_secs: 30,
             max_request_body_mb: 512,
             codex_context_body_limit_mb: 32,
-            codex_auto_compact_token_limit: 120_000,
+            codex_auto_compact_token_limit: 240_000,
+            codex_context_soft_token_limit: 264_192,
+            codex_compact_retry_enabled: true,
+            codex_compact_max_attempts: 1,
         };
         cfg.local_auth_token = "test-token".to_string();
         cfg.routing = routing;

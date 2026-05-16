@@ -257,6 +257,9 @@ async fn save_config_handler(
         return resp;
     }
     config.normalize_balance_auth();
+    for provider in &mut config.providers {
+        provider.normalize_capabilities();
+    }
     if let Err(err) = state.storage.set_config(config.clone()).await {
         return api_error(StatusCode::BAD_REQUEST, &err_string(err));
     }
@@ -282,6 +285,7 @@ async fn create_provider_handler(
         provider.id = uuid::Uuid::new_v4().to_string();
     }
     provider.normalize_balance_auth();
+    provider.normalize_capabilities();
     if let Err(err) = validate_provider(&provider) {
         return api_error(StatusCode::BAD_REQUEST, &err.to_string());
     }
@@ -306,6 +310,7 @@ async fn update_provider_handler(
     }
     provider.id = provider_id;
     provider.normalize_balance_auth();
+    provider.normalize_capabilities();
     if let Err(err) = validate_provider(&provider) {
         return api_error(StatusCode::BAD_REQUEST, &err.to_string());
     }
@@ -652,6 +657,8 @@ async fn import_providers_inner(storage: &Storage, raw: &str) -> Result<Provider
                     provider.id = uuid::Uuid::new_v4().to_string();
                 }
                 provider.id = provider.id.trim().to_string();
+                provider.normalize_balance_auth();
+                provider.normalize_capabilities();
                 if seen.contains(&provider.id) || validate_provider(&provider).is_err() {
                     skipped += 1;
                     continue;

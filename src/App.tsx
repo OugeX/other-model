@@ -70,6 +70,11 @@ const cloneProvider = (provider: ProviderConfig): ProviderConfig => ({
     ...(provider.balance_auth ?? {}),
     mode: balanceQueryMode(provider),
   },
+  capabilities: {
+    responses_api: provider.capabilities?.responses_api ?? true,
+    responses_compact: provider.capabilities?.responses_compact ?? false,
+    token_count: provider.capabilities?.token_count ?? true,
+  },
 });
 
 export default function App() {
@@ -486,6 +491,12 @@ function ProviderEditor({ provider, onClose, runBusy }: { provider: ProviderConf
           <label>超时秒<input type="number" value={draft.timeout_secs} onChange={(e) => setDraft({ ...draft, timeout_secs: Number(e.target.value) || 300 })} /></label>
         </div>
         <div className="card">
+          <h4>能力声明</h4>
+          <label><input type="checkbox" checked={draft.capabilities.responses_api} onChange={(e) => setDraft({ ...draft, capabilities: { ...draft.capabilities, responses_api: e.target.checked } })} /> 支持 Responses API</label>
+          <label><input type="checkbox" checked={draft.capabilities.responses_compact} onChange={(e) => setDraft({ ...draft, capabilities: { ...draft.capabilities, responses_compact: e.target.checked } })} /> 遗留：支持上游原生 /v1/responses/compact</label>
+          <label><input type="checkbox" checked={draft.capabilities.token_count} onChange={(e) => setDraft({ ...draft, capabilities: { ...draft.capabilities, token_count: e.target.checked } })} /> 支持 token 估算/计数</label>
+        </div>
+        <div className="card">
           <h4>余额查询方式</h4>
           <label>查询模式
             <select value={balanceMode} onChange={(e) => setBalanceMode(e.target.value as BalanceAuthMode)}>
@@ -743,14 +754,14 @@ function Logs({ logs }: { logs: RequestLogEntry[] }) {
   return (
     <section className="card table-card">
       <table>
-        <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>模型</th><th>供应商</th><th>状态</th><th>大小</th><th>耗时</th><th>错误 / 切换原因</th></tr></thead>
+        <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>模型</th><th>供应商</th><th>状态</th><th>大小</th><th>估算 Token</th><th>耗时</th><th>错误 / Compact</th></tr></thead>
         <tbody>
           {pageItems.map((l) => (
             <tr key={l.id}>
-              <td>{new Date(l.timestamp).toLocaleString()}</td><td>{l.method}</td><td><code>{l.path}</code></td><td>{l.model ?? '-'}</td><td>{l.provider_name ?? (l.local_rejected ? (l.error_kind === 'context_too_large' ? '本地压缩提示' : '本地拒绝') : '-')}</td><td>{l.status ?? '-'}</td><td>{formatBytes(l.body_size_bytes)}</td><td>{l.latency_ms}ms</td><td className="truncate">{l.error_kind ? `${l.error_kind}: ` : ''}{l.error ?? l.failover_reason ?? '-'}</td>
+              <td>{new Date(l.timestamp).toLocaleString()}</td><td>{l.method}</td><td><code>{l.path}</code></td><td>{l.model ?? '-'}</td><td>{l.provider_name ?? (l.local_rejected ? (l.error_kind === 'context_too_large' ? '本地压缩提示' : '本地拒绝') : '-')}</td><td>{l.status ?? '-'}</td><td>{formatBytes(l.body_size_bytes)}</td><td>{l.estimated_input_tokens ?? '-'}</td><td>{l.latency_ms}ms</td><td className="truncate">{l.error_kind ? `${l.error_kind}: ` : ''}{l.error ?? l.failover_reason ?? '-'}{l.compact_attempted ? ` · compact:${l.compacted ? 'ok' : 'attempted'}${l.compact_provider_name ? ` @ ${l.compact_provider_name}` : ''}${l.compact_error ? ` · ${l.compact_error}` : ''}` : ''}</td>
             </tr>
           ))}
-          {!logs.length && <tr><td colSpan={9}>暂无请求日志。</td></tr>}
+          {!logs.length && <tr><td colSpan={10}>暂无请求日志。</td></tr>}
         </tbody>
       </table>
       <Pagination page={page} total={logs.length} onPageChange={setPage} />
@@ -888,7 +899,9 @@ function Settings({
           <label>流式闲置超时秒<input type="number" value={config.gateway.stream_idle_timeout_secs} onChange={(e) => update({ gateway: { ...config.gateway, stream_idle_timeout_secs: Number(e.target.value) || 300 } })} /></label>
           <label>最大请求体 MB<input type="number" value={config.gateway.max_request_body_mb} onChange={(e) => update({ gateway: { ...config.gateway, max_request_body_mb: Number(e.target.value) || 512 } })} /></label>
           <label>Codex 上下文软限 MB<input type="number" value={config.gateway.codex_context_body_limit_mb ?? 32} onChange={(e) => update({ gateway: { ...config.gateway, codex_context_body_limit_mb: Number(e.target.value) || 0 } })} /></label>
-          <label>Codex 自动压缩 token<input type="number" value={config.gateway.codex_auto_compact_token_limit ?? 120000} onChange={(e) => update({ gateway: { ...config.gateway, codex_auto_compact_token_limit: Number(e.target.value) || 120000 } })} /></label>
+          <label>Codex 上下文软限 token<input type="number" value={config.gateway.codex_context_soft_token_limit ?? 264192} onChange={(e) => update({ gateway: { ...config.gateway, codex_context_soft_token_limit: Number(e.target.value) || 264192 } })} /></label>
+          <label>Codex 自动压缩 token<input type="number" value={config.gateway.codex_auto_compact_token_limit ?? 240000} onChange={(e) => update({ gateway: { ...config.gateway, codex_auto_compact_token_limit: Number(e.target.value) || 240000 } })} /></label>
+          <label>compact 最大次数<input type="number" value={config.gateway.codex_compact_max_attempts ?? 1} onChange={(e) => update({ gateway: { ...config.gateway, codex_compact_max_attempts: Number(e.target.value) || 1 } })} /></label>
           <label>最大重试<input type="number" value={config.routing.max_attempts_per_request} onChange={(e) => update({ routing: { ...config.routing, max_attempts_per_request: Number(e.target.value) || 1 } })} /></label>
           <label>基础冷却秒<input type="number" value={config.routing.cooldown_secs} onChange={(e) => update({ routing: { ...config.routing, cooldown_secs: Number(e.target.value) || 60 } })} /></label>
           <label>认证失败阈值<input type="number" value={config.routing.auth_failure_threshold ?? 2} onChange={(e) => update({ routing: { ...config.routing, auth_failure_threshold: Number(e.target.value) || 2 } })} /></label>
@@ -907,7 +920,8 @@ function Settings({
           </select>
         </label>
         {(config.routing.auto_round_robin ?? true) && <p className="inline-help">自动轮询开启时会忽略单选供应商。</p>}
-        <p className="inline-help">Codex 上下文软限只拦截 <code>/v1/responses</code> / <code>/v1/chat/completions</code> 的超大上下文请求，并向 Codex 回传 <code>context_length_exceeded</code> 促使客户端压缩上下文；设为 0 可关闭。</p>
+        <p className="inline-help">MB 软限属于 body 级保护；token 软限更接近真实上下文限制。两者都会在超限时返回 <code>context_length_exceeded</code>，促使客户端压缩上下文。</p>
+        <label><input type="checkbox" checked={config.gateway.codex_compact_retry_enabled ?? true} onChange={(e) => update({ gateway: { ...config.gateway, codex_compact_retry_enabled: e.target.checked } })} /> 启用自动 compact 重试（非流式自动重试；流式仅发送前预压缩）</label>
         <label><input type="checkbox" checked={config.routing.auto_failover ?? true} onChange={(e) => update({ routing: { ...config.routing, auto_failover: e.target.checked } })} /> 自动切换供应商（开启后认证异常、权限限制、余额/限流、5xx、模型错误会尝试下一个）</label>
         <label><input type="checkbox" checked={config.gateway.require_local_token} onChange={(e) => update({ gateway: { ...config.gateway, require_local_token: e.target.checked } })} /> 要求本地 Authorization token</label>
         <label>本地 Token<input value={config.local_auth_token} onChange={(e) => update({ local_auth_token: e.target.value })} /></label>

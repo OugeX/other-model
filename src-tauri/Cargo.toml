@@ -54,6 +54,7 @@ tokio-util = { version = "0.7.17", features = ["io"] }
 toml = "0.9.8"
 toml_edit = { version = "0.23.7", features = ["serde"] }
 tower-http = { version = "0.6.7", features = ["cors", "trace", "fs"] }
+tiktoken-rs = "0.11.0"
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
 
 [dev-dependencies]

@@ -1,4 +1,7 @@
-use crate::models::{AppConfig, ModelsCache, RequestLogEntry, RuntimeState};
+use crate::models::{
+    AppConfig, ModelsCache, RequestLogEntry, RuntimeState, DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT,
+    DEFAULT_CODEX_CONTEXT_SOFT_TOKEN_LIMIT,
+};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::{path::PathBuf, sync::Arc};
@@ -48,16 +51,21 @@ impl Storage {
                 .with_context(|| format!("read {}", config_path.display()))?;
             let cfg = toml::from_str::<AppConfig>(&raw)
                 .with_context(|| format!("parse {}", config_path.display()))?;
-            let should_save = !raw.contains("auto_round_robin")
+            let mut should_save = !raw.contains("auto_round_robin")
                 || !raw.contains("auto_failover")
                 || !raw.contains("selected_provider_id")
                 || !raw.contains("stream_idle_timeout_secs")
                 || !raw.contains("max_request_body_mb")
                 || !raw.contains("codex_context_body_limit_mb")
                 || !raw.contains("codex_auto_compact_token_limit")
+                || !raw.contains("codex_context_soft_token_limit")
+                || !raw.contains("codex_compact_retry_enabled")
+                || !raw.contains("codex_compact_max_attempts")
                 || !raw.contains("auth_failure_threshold")
                 || !raw.contains("probe_interval_secs")
                 || !raw.contains("max_cooldown_secs");
+            let mut cfg = cfg;
+            should_save |= migrate_legacy_gateway_defaults(&mut cfg);
             (cfg, should_save)
         } else {
             let cfg = AppConfig::default();
@@ -134,7 +142,9 @@ impl Storage {
                     cfg
                 }
             };
-            if config.normalize_balance_auth() {
+            let mut config_changed = migrate_legacy_gateway_defaults(&mut config);
+            config_changed |= config.normalize_balance_auth();
+            if config_changed {
                 sqlite_set_app_value(&conn, "config", &config)?;
             }
             let mut runtime_state =
@@ -498,9 +508,82 @@ fn sqlite_sync_models_cache(conn: &Connection, cache: &ModelsCache) -> Result<()
     Ok(())
 }
 
+fn migrate_legacy_gateway_defaults(config: &mut AppConfig) -> bool {
+    let mut changed = false;
+
+    if config.gateway.codex_context_soft_token_limit == 120_000 {
+        config.gateway.codex_context_soft_token_limit = DEFAULT_CODEX_CONTEXT_SOFT_TOKEN_LIMIT;
+        changed = true;
+    }
+
+    if config.gateway.codex_auto_compact_token_limit == 120_000 {
+        config.gateway.codex_auto_compact_token_limit = DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT;
+        changed = true;
+    }
+
+    if config.gateway.codex_compact_max_attempts == 0 {
+        config.gateway.codex_compact_max_attempts = 1;
+        changed = true;
+    }
+
+    changed
+}
+
 #[cfg(test)]
 mod sqlite_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn file_storage_loads_legacy_config_with_new_gateway_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            r#"
+[gateway]
+host = "127.0.0.1"
+port = 14555
+require_local_token = false
+request_timeout_secs = 300
+stream_idle_timeout_secs = 300
+max_request_body_mb = 512
+codex_context_body_limit_mb = 32
+codex_auto_compact_token_limit = 120000
+
+local_auth_token = "legacy-token"
+
+[[providers]]
+id = "legacy"
+name = "Legacy Provider"
+base_url = "https://legacy.example.com/v1"
+api_key = "legacy-key"
+enabled = true
+timeout_secs = 60
+headers = {}
+query = {}
+
+[routing]
+auto_round_robin = true
+auto_failover = true
+max_attempts_per_request = 2
+cooldown_secs = 60
+"#,
+        )
+        .await
+        .unwrap();
+
+        let storage = Storage::load_from_dir(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let cfg = storage.config().await;
+        assert_eq!(cfg.gateway.codex_context_soft_token_limit, 264_192);
+        assert_eq!(cfg.gateway.codex_auto_compact_token_limit, 240_000);
+        assert!(cfg.gateway.codex_compact_retry_enabled);
+        assert_eq!(cfg.gateway.codex_compact_max_attempts, 1);
+        assert!(cfg.providers[0].capabilities.responses_api);
+        assert!(cfg.providers[0].capabilities.responses_compact);
+        assert!(cfg.providers[0].capabilities.token_count);
+    }
 
     #[tokio::test]
     async fn sqlite_storage_initializes_and_persists() {
@@ -523,5 +606,29 @@ mod sqlite_tests {
         let reopened = Storage::load_sqlite(db).await.unwrap();
         assert_eq!(reopened.config().await.gateway.port, 14556);
         assert_eq!(reopened.read_logs(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_storage_upgrades_legacy_gateway_token_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("other-model.sqlite");
+        let conn = sqlite_connection(&db).unwrap();
+        migrate_sqlite(&conn).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.gateway.codex_auto_compact_token_limit = 120_000;
+        cfg.gateway.codex_context_soft_token_limit = 120_000;
+        sqlite_set_app_value(&conn, "config", &cfg).unwrap();
+        sqlite_sync_providers(&conn, &cfg).unwrap();
+
+        let storage = Storage::load_sqlite(db.clone()).await.unwrap();
+        let upgraded = storage.config().await;
+        assert_eq!(upgraded.gateway.codex_auto_compact_token_limit, 240_000);
+        assert_eq!(upgraded.gateway.codex_context_soft_token_limit, 264_192);
+
+        let reopened = Storage::load_sqlite(db).await.unwrap();
+        let persisted = reopened.config().await;
+        assert_eq!(persisted.gateway.codex_auto_compact_token_limit, 240_000);
+        assert_eq!(persisted.gateway.codex_context_soft_token_limit, 264_192);
     }
 }

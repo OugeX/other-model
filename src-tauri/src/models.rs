@@ -31,6 +31,7 @@ impl AppConfig {
         let mut changed = false;
         for provider in &mut self.providers {
             changed |= provider.normalize_balance_auth();
+            changed |= provider.normalize_capabilities();
         }
         changed
     }
@@ -53,10 +54,19 @@ pub struct GatewayConfig {
     /// Token threshold advertised to Codex so it auto-compacts before requests
     /// grow into oversized context payloads.
     pub codex_auto_compact_token_limit: i64,
+    /// Soft token threshold used by the local gateway to detect oversized Codex
+    /// request payloads before upstream context errors occur.
+    pub codex_context_soft_token_limit: i64,
+    /// Whether non-streaming oversized requests may trigger a local compact + retry flow.
+    pub codex_compact_retry_enabled: bool,
+    /// Maximum local compact retries per request. Current implementation caps this at 1.
+    pub codex_compact_max_attempts: u8,
 }
 
 pub const DEFAULT_CODEX_CONTEXT_BODY_LIMIT_MB: u64 = 32;
-pub const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT: i64 = 120_000;
+pub const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT: i64 = 240_000;
+pub const DEFAULT_CODEX_CONTEXT_SOFT_TOKEN_LIMIT: i64 = 264_192;
+pub const DEFAULT_CODEX_COMPACT_MAX_ATTEMPTS: u8 = 1;
 
 impl Default for GatewayConfig {
     fn default() -> Self {
@@ -69,6 +79,9 @@ impl Default for GatewayConfig {
             max_request_body_mb: 512,
             codex_context_body_limit_mb: DEFAULT_CODEX_CONTEXT_BODY_LIMIT_MB,
             codex_auto_compact_token_limit: DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT,
+            codex_context_soft_token_limit: DEFAULT_CODEX_CONTEXT_SOFT_TOKEN_LIMIT,
+            codex_compact_retry_enabled: true,
+            codex_compact_max_attempts: DEFAULT_CODEX_COMPACT_MAX_ATTEMPTS,
         }
     }
 }
@@ -122,8 +135,43 @@ impl Default for RoutingConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct ProviderCapabilities {
+    pub responses_api: bool,
+    pub responses_compact: bool,
+    pub token_count: bool,
+}
+
+impl ProviderCapabilities {
+    pub fn infer_from_base_url(base_url: &str) -> Self {
+        let lower = base_url.trim().to_ascii_lowercase();
+        let supports_responses = lower.starts_with("http://") || lower.starts_with("https://");
+        let likely_openai_compatible = lower.contains("/v1")
+            || lower.contains("openai")
+            || lower.contains("codex")
+            || lower.contains("chatgpt")
+            || lower.contains("router")
+            || lower.contains("compat");
+        Self {
+            responses_api: supports_responses,
+            responses_compact: supports_responses && likely_openai_compatible,
+            token_count: supports_responses && likely_openai_compatible,
+        }
+    }
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            responses_api: true,
+            responses_compact: false,
+            token_count: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProviderConfig {
     pub id: String,
     pub name: String,
@@ -135,6 +183,71 @@ pub struct ProviderConfig {
     pub query: BTreeMap<String, String>,
     pub quota: Option<QuotaConfig>,
     pub balance_auth: Option<BalanceAuthConfig>,
+    pub capabilities: ProviderCapabilities,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ProviderConfigSerde {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub enabled: bool,
+    pub timeout_secs: u64,
+    pub headers: BTreeMap<String, String>,
+    pub query: BTreeMap<String, String>,
+    pub quota: Option<QuotaConfig>,
+    pub balance_auth: Option<BalanceAuthConfig>,
+    pub capabilities: Option<ProviderCapabilities>,
+}
+
+impl Default for ProviderConfigSerde {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "New Provider".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: String::new(),
+            enabled: false,
+            timeout_secs: 300,
+            headers: BTreeMap::new(),
+            query: BTreeMap::new(),
+            quota: None,
+            balance_auth: Some(BalanceAuthConfig::default()),
+            capabilities: None,
+        }
+    }
+}
+
+impl From<ProviderConfigSerde> for ProviderConfig {
+    fn from(value: ProviderConfigSerde) -> Self {
+        let capabilities = value
+            .capabilities
+            .unwrap_or_else(|| ProviderCapabilities::infer_from_base_url(&value.base_url));
+        Self {
+            id: value.id,
+            name: value.name,
+            base_url: value.base_url,
+            api_key: value.api_key,
+            enabled: value.enabled,
+            timeout_secs: value.timeout_secs,
+            headers: value.headers,
+            query: value.query,
+            quota: value.quota,
+            balance_auth: value.balance_auth,
+            capabilities,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(ProviderConfigSerde::deserialize(deserializer)?.into())
+    }
 }
 
 impl ProviderConfig {
@@ -150,6 +263,7 @@ impl ProviderConfig {
             query: BTreeMap::new(),
             quota: None,
             balance_auth: Some(BalanceAuthConfig::default()),
+            capabilities: ProviderCapabilities::infer_from_base_url(base_url),
         }
     }
 
@@ -166,6 +280,17 @@ impl ProviderConfig {
     pub fn normalize_balance_auth(&mut self) -> bool {
         if self.balance_auth.is_none() {
             self.balance_auth = Some(self.effective_balance_auth());
+            return true;
+        }
+        false
+    }
+
+    pub fn normalize_capabilities(&mut self) -> bool {
+        if !self.capabilities.responses_api
+            && (self.capabilities.responses_compact || self.capabilities.token_count)
+        {
+            self.capabilities.responses_compact = false;
+            self.capabilities.token_count = false;
             return true;
         }
         false
@@ -466,6 +591,11 @@ pub struct RequestLogEntry {
     pub error_kind: Option<String>,
     pub error: Option<String>,
     pub usage: Option<Value>,
+    pub estimated_input_tokens: Option<i64>,
+    pub compacted: bool,
+    pub compact_attempted: bool,
+    pub compact_provider_name: Option<String>,
+    pub compact_error: Option<String>,
 }
 
 impl Default for RequestLogEntry {
@@ -488,6 +618,11 @@ impl Default for RequestLogEntry {
             error_kind: None,
             error: None,
             usage: None,
+            estimated_input_tokens: None,
+            compacted: false,
+            compact_attempted: false,
+            compact_provider_name: None,
+            compact_error: None,
         }
     }
 }

@@ -111,6 +111,7 @@ pub async fn create_provider(
         provider.id = uuid::Uuid::new_v4().to_string();
     }
     provider.normalize_balance_auth();
+    provider.normalize_capabilities();
     validate_provider(&provider).map_err(|e| e.to_string())?;
     state
         .storage
@@ -126,6 +127,7 @@ pub async fn update_provider(
     mut provider: ProviderConfig,
 ) -> Result<ProviderConfig, String> {
     provider.normalize_balance_auth();
+    provider.normalize_capabilities();
     validate_provider(&provider).map_err(|e| e.to_string())?;
     let found = state
         .storage
@@ -229,6 +231,8 @@ pub async fn import_providers(
                     provider.id = uuid::Uuid::new_v4().to_string();
                 }
                 provider.id = provider.id.trim().to_string();
+                provider.normalize_balance_auth();
+                provider.normalize_capabilities();
                 if seen.contains(&provider.id) || validate_provider(&provider).is_err() {
                     skipped += 1;
                     continue;
